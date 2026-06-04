@@ -1598,13 +1598,22 @@ function netJoinHost(hostCode, onConnected, onMessage, onError) {
   });
 }
 
-// Host: broadcast to all connected clients
+// Host: broadcast to all connected clients. Skips clients whose data channel
+// is backed up (bufferedAmount high) so a slow connection doesn't cause the
+// host to queue an ever-growing backlog of snapshots — the prime cause of
+// runaway lag during big battles.
 function netBroadcast(msg) {
+  let payload;
   for (const pid in Net.clientConns) {
     const c = Net.clientConns[pid];
-    if (c && c.open) {
-      try { c.send(msg); } catch (e) { /* ignore */ }
-    }
+    if (!c || !c.open) continue;
+    // PeerJS exposes the underlying RTCDataChannel as c.dataChannel
+    const dc = c.dataChannel;
+    if (dc && dc.bufferedAmount > 256 * 1024) continue; // 256 KB backlog → skip this tick
+    try {
+      if (payload === undefined) payload = msg;
+      c.send(payload);
+    } catch (e) { /* ignore */ }
   }
 }
 
@@ -1645,11 +1654,21 @@ function buildSnapshot() {
       s.tier = e.tier || 0;
       s.workResource = e.workResource;
       s.workerCount = e.workers ? e.workers.length : 0;
+      // City capture / assimilation state — needed so clients can render the
+      // capture progress ring and show the right ownership.
+      if (e.subtype === 'city') {
+        s.assimilating = !!e.assimilating;
+        s.assimilationTeam = e.assimilationTeam || null;
+        s.assimilationProgress = e.assimilationProgress || 0;
+      }
     }
     if (e.type === 'unit') {
       s.targetX = e.targetX; s.targetY = e.targetY;
-      s.attackTarget = e.attackTarget;
-      s.carrying = e.carrying;
+      // attackTarget is an entity reference at runtime — serialize only its id
+      // (sending the object recursively bloats the payload and can blow up the
+      // WebRTC channel during big battles, which was the main cause of lag).
+      s.attackTargetId = (e.attackTarget && e.attackTarget.id != null) ? e.attackTarget.id : null;
+      s.carrying = e.carrying || null;
       s.gathering = e.gathering ? { resource: e.gathering.resource } : null;
       s.speed = e.speed;
       s.attack = e.attack;
@@ -1658,9 +1677,12 @@ function buildSnapshot() {
       s.sight = e.sight;
       s.ranged = e.ranged;
       s.flying = e.flying;
+      s.facing = e.facing;
+      s.attackMove = !!e.attackMove;
     }
     if (e.type === 'resource') {
       s.resource = e.resource;
+      s.amount = e.amount;
     }
     return s;
   });
@@ -1734,18 +1756,42 @@ function applySnapshot(snap) {
   for (const se of snap.entities) {
     seen.add(se.id);
     let e = byId[se.id];
+    const isNew = !e;
     if (!e) {
       // New entity — create a shell; full props come from snap
       e = { radius: 0.45, queue: [], attackCdRemain: 0, progress: 0 };
       State.entities.push(e);
       byId[se.id] = e;
     }
-    // Patch all fields from snapshot
-    Object.assign(e, se);
+    if (se.type === 'unit' && !isNew && e.x != null) {
+      // Keep the current rendered position and slide toward the host's
+      // authoritative position (set _netX/_netY); the game loop lerps each
+      // frame. This hides the 10 Hz snapshot cadence so units glide instead
+      // of teleporting between updates.
+      const renderX = (e._renderX != null) ? e._renderX : e.x;
+      const renderY = (e._renderY != null) ? e._renderY : e.y;
+      Object.assign(e, se);
+      e._netX = se.x; e._netY = se.y;
+      e._renderX = renderX; e._renderY = renderY;
+      e.x = renderX; e.y = renderY;
+    } else {
+      Object.assign(e, se);
+      if (se.type === 'unit') { e._renderX = se.x; e._renderY = se.y; e._netX = se.x; e._netY = se.y; }
+    }
   }
 
   // Remove entities no longer in snapshot
   State.entities = State.entities.filter(e => seen.has(e.id));
+
+  // Reconstruct attackTarget object references from the ids in the snapshot
+  // (we serialized them as attackTargetId to avoid recursive bloat).
+  for (const e of State.entities) {
+    if (e.type === 'unit' && e.attackTargetId != null) {
+      e.attackTarget = byId[e.attackTargetId] || null;
+    } else if (e.type === 'unit') {
+      e.attackTarget = null;
+    }
+  }
 
   // CLIENT-only patch maintenance: the resource entities had their
   // `patch`/`patchId` back-refs wiped by Object.assign above, so re-link them
@@ -2439,6 +2485,14 @@ function canPlaceBuilding(type, tx, ty, owner, rotated = false) {
     }
   }
   if (def.placeOnResource && !foundRequired) return false;
+  // Extractors (lumber camp / mine) must be placed adjacent to a matching,
+  // unclaimed resource patch. Without this check the building could be placed
+  // anywhere and would simply never produce. (Derrick uses placeOnResource
+  // above instead, so it's excluded here.)
+  if (def.extractor && !def.placeOnResource) {
+    const subtypes = type === 'lumber' ? ['forest'] : (type === 'mine' ? ['gold', 'ore'] : [def.extractor]);
+    if (!extractorHasAdjacentPatch(tx, ty, w, h, subtypes)) return false;
+  }
   // City-radius restriction: certain buildings (farm, house) must sit inside
   // the build radius of one of OWNER's cities. We require an owner parameter
   // for this check; if it's missing (legacy callers), we permit placement so
@@ -2547,6 +2601,25 @@ function findAdjacentPatch(building, subtype) {
     }
   }
   return best;
+}
+
+// Tile-based version used during placement validation (the building doesn't
+// exist yet). Returns true if an UNCLAIMED patch of one of `subtypes` lies
+// adjacent to the footprint at (tx,ty,w,h). Mirrors findAdjacentPatch's
+// geometry and the render-preview threshold so validation and preview agree.
+function extractorHasAdjacentPatch(tx, ty, w, h, subtypes) {
+  const cx = tx + w / 2, cy = ty + h / 2;
+  const halfW = w / 2, halfH = h / 2;
+  for (const p of State.patches) {
+    if (!subtypes.includes(p.subtype)) continue;
+    if (p.claimedBy && !p.claimedBy._killed && p.claimedBy.hp > 0) continue;
+    for (const node of p.members) {
+      const dx = Math.max(0, Math.abs(node.x - cx) - halfW);
+      const dy = Math.max(0, Math.abs(node.y - cy) - halfH);
+      if (Math.hypot(dx, dy) < 1.85) return true;
+    }
+  }
+  return false;
 }
 
 // Try to claim the right kind of patch for this extractor
@@ -4158,16 +4231,14 @@ function startCityAssimilation(city) {
   city.assimilationTeam = captureTeam;
   city.assimilationProgress = 0;
   city.hp = 1;
-  if (city.owner === HUMAN_ID || teamOf(city.owner) === teamOf(HUMAN_ID)) {
-    // Find a representative player on the capturing team for display
-    let teamName = 'Team ' + captureTeam;
-    for (const pid in State.players) {
-      if (State.players[pid].team === captureTeam) { teamName = State.players[pid].colorName; break; }
-    }
-    showMessage(`Your city is being captured by ${teamName}! Defend it!`, 'warn');
-  } else if (captureTeam === teamOf(HUMAN_ID)) {
-    showMessage(`Your forces are capturing an enemy city — hold the ground!`, 'victory');
+  // Notify the defending team (whoever owns the city) and the attacking team.
+  const defenderTeam = teamOf(city.owner);
+  let attackerName = 'Team ' + captureTeam;
+  for (const pid in State.players) {
+    if (State.players[pid].team === captureTeam) { attackerName = State.players[pid].colorName || attackerName; break; }
   }
+  notifyTeam(defenderTeam, `Your city is being captured by ${attackerName}! Defend it!`, 'warn');
+  notifyTeam(captureTeam, `Your forces are capturing an enemy city — hold the ground!`, 'victory');
 }
 
 function updateCityAssimilation(city, dt) {
@@ -4205,9 +4276,7 @@ function updateCityAssimilation(city, dt) {
     city.assimilationTeam = null;
     city.assimilationProgress = 0;
     city.hp = Math.max(city.hp, city.maxHp * 0.2);
-    if (city.owner === HUMAN_ID || teamOf(city.owner) === teamOf(HUMAN_ID)) {
-      showMessage('Your defenders repelled the capture attempt!', 'victory');
-    }
+    notifyTeam(teamOf(city.owner), 'Your defenders repelled the capture attempt!', 'victory');
   } else {
     // Nobody nearby. Slow drift back toward neutral and gradual heal.
     city.assimilationProgress = Math.max(0, city.assimilationProgress - dt * 0.5);
@@ -4326,16 +4395,14 @@ function finalizeCityCapture(city) {
     o.owner = newOwner;
     transferred++;
   }
-  if (transferred > 0 && (newOwner === HUMAN_ID || newTeam === teamOf(HUMAN_ID))) {
-    showMessage(`Inherited ${transferred} buildings around the captured city.`, 'victory');
+  if (transferred > 0) {
+    notifyTeam(newTeam, `Inherited ${transferred} buildings around the captured city.`, 'victory');
   }
 
   const newOwnerName = (State.players[newOwner] && State.players[newOwner].colorName) || ('Team ' + newTeam);
-  if (newOwner === HUMAN_ID || newTeam === teamOf(HUMAN_ID)) {
-    showMessage(`Captured a city! It now serves your empire.`, 'victory');
-  } else if (oldOwner === HUMAN_ID || teamOf(oldOwner) === teamOf(HUMAN_ID)) {
-    showMessage(`A city was lost to ${newOwnerName}.`, 'warn');
-  }
+  const oldOwnerName = (State.players[oldOwner] && State.players[oldOwner].colorName) || ('Team ' + oldTeam);
+  notifyTeam(newTeam, `Captured a city! It now serves your empire.`, 'victory');
+  notifyTeam(oldTeam, `A city was lost to ${newOwnerName}.`, 'warn');
 
   // Ownership transferred — trigger an immediate idle-builder scan so
   // citizens of the new owner notice the ruins and start repairing right
@@ -8625,6 +8692,39 @@ function showMessage(text, type = 'info') {
   setTimeout(() => div.remove(), 6000);
 }
 
+// Deliver a message to a SPECIFIC player by id. On the host, this shows the
+// message locally if the target is the host's own slot, otherwise it sends
+// the message over the network to the client occupying that slot. Used for
+// per-player events (city captures, age advances) so each player only sees
+// their own notifications regardless of who's simulating.
+function notifyPlayer(playerId, text, type = 'info') {
+  if (Net.mode === 'host') {
+    if (playerId === HUMAN_ID) {
+      showMessage(text, type);
+    } else {
+      // Find the connection for this slot and send
+      for (const peerId in Net.clientConns) {
+        if (Net.clientSlots[peerId] === playerId) {
+          const c = Net.clientConns[peerId];
+          if (c && c.open) { try { c.send({ type: 'msg', text, style: type }); } catch (e) {} }
+          break;
+        }
+      }
+    }
+  } else if (Net.mode === 'solo') {
+    if (playerId === HUMAN_ID) showMessage(text, type);
+  }
+  // (Client mode never originates notifyPlayer calls — the host does.)
+}
+
+// Deliver a message to all players on a given TEAM (host shows locally for its
+// own slot, sends to every client whose slot is on that team).
+function notifyTeam(teamId, text, type = 'info') {
+  for (const pid in State.players) {
+    if (teamOf(pid) === teamId) notifyPlayer(pid, text, type);
+  }
+}
+
 function updateResourceHUD() {
   const p = State.players[HUMAN_ID];
   document.getElementById('age-name').textContent = AGES[p.age];
@@ -10378,6 +10478,22 @@ function loop(t) {
           applySnapshot(Net.pendingSnapshot);
           Net.pendingSnapshot = null;
         }
+        // Smoothly interpolate unit render positions toward the authoritative
+        // positions from the latest snapshot. lerpRate tuned so a unit closes
+        // most of the gap within ~100 ms (one snapshot interval) but never
+        // overshoots. This makes movement look continuous at 60 fps despite
+        // 10 Hz network updates.
+        const lerp = Math.min(1, dt * 12);
+        for (const e of State.entities) {
+          if (e.type !== 'unit' || e._netX == null) continue;
+          e._renderX += (e._netX - e._renderX) * lerp;
+          e._renderY += (e._netY - e._renderY) * lerp;
+          e.x = e._renderX;
+          e.y = e._renderY;
+        }
+        // Refresh fog occasionally on the client too
+        fogTimer += dt;
+        if (fogTimer > 0.25) { revealFog(); fogTimer = 0; }
       } else {
         // ────── HOST / SOLO: full simulation ──────
         // Update entities
