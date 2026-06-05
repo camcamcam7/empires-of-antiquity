@@ -1892,12 +1892,22 @@ function hostExecCmd(playerId, data) {
   const player = State.players[playerId];
   if (!player) return;
 
-  if (data.cmd === 'rightclick') {
-    // Restore selection state from client's reported selectedIds
-    if (data.selectedIds) {
-      State.selected.clear();
-      for (const id of data.selectedIds) State.selected.add(id);
+  // SECURITY: restore selection from the client's reported ids, but ONLY for
+  // entities the commanding player actually owns. This prevents a client from
+  // commanding a bot's or another player's units/buildings by sending their
+  // ids in selectedIds. All command paths funnel through here.
+  function restoreOwnedSelection(ids) {
+    State.selected.clear();
+    if (!ids) return;
+    for (const id of ids) {
+      const ent = State.entities.find(e => e.id === id);
+      if (ent && ent.owner === playerId && !ent._killed) State.selected.add(id);
     }
+  }
+
+  if (data.cmd === 'rightclick') {
+    restoreOwnedSelection(data.selectedIds);
+    if (State.selected.size === 0) return; // nothing the player owns is selected
     const w = { x: data.wx, y: data.wy };
     const target = data.targetId ? State.entities.find(e => e.id === data.targetId) : entityAt(w.x, w.y);
     // Run the full handleRightClick logic for this player
@@ -1906,11 +1916,7 @@ function hostExecCmd(playerId, data) {
   }
 
   else if (data.cmd === 'build') {
-    // Restore selection for builder assignment
-    if (data.selectedIds) {
-      State.selected.clear();
-      for (const id of data.selectedIds) State.selected.add(id);
-    }
+    restoreOwnedSelection(data.selectedIds);
     const { buildType, ptx, pty, rotated } = data;
     const def = BUILDINGS[buildType];
     if (!def) return;
@@ -2037,7 +2043,9 @@ function uiStartHost() {
       renderSlotList();
     },
     (peerId, conn) => {
-      // A new client joined — assign them the next open human slot
+      // A new client joined — assign them the next open slot (one not already
+      // taken by another remote player). We give remote players an
+      // unambiguous id ('remoteN') so it can never collide with a bot's 'aiN'.
       const openSlots = State.slots.filter((s, i) => i > 0 && s.type !== 'human-remote');
       if (openSlots.length === 0) {
         // No room — reject
@@ -2046,6 +2054,11 @@ function uiStartHost() {
         return;
       }
       const slot = openSlots[0];
+      // Find a free remoteN id
+      const usedRemote = new Set(Object.values(Net.clientSlots));
+      let n = 1;
+      while (usedRemote.has('remote' + n)) n++;
+      slot.id = 'remote' + n;
       slot.type = 'human-remote';
       slot.name = 'Player ' + (State.slots.indexOf(slot) + 1);
       Net.clientSlots[peerId] = slot.id;
@@ -2056,12 +2069,12 @@ function uiStartHost() {
         `${joined} player${joined === 1 ? '' : 's'} joined. Waiting…`;
     },
     (peerId) => {
-      // Client left — free their slot
+      // Client left — free their slot back to an AI slot
       const slotId = Net.clientSlots[peerId];
       delete Net.clientSlots[peerId];
       if (slotId) {
         const sl = State.slots.find(s => s.id === slotId);
-        if (sl) { sl.type = 'ai'; sl.name = undefined; }
+        if (sl) { sl.type = 'ai'; sl.name = undefined; sl.id = undefined; }
         renderSlotList();
       }
       const joined = Object.keys(Net.clientConns).length;
@@ -3297,10 +3310,11 @@ function updateEntity(e, dt) {
     // This lets a conqueror capture the surrounding city and then rebuild the
     // ruins — economic AND military buildings can be inherited and revived.
     //
-    // Exceptions: walls, fortresses, watch towers, AA towers are still
-    // physically destroyed when killed (they're defensive structures that
-    // crumble in a real fight).
-    const STILL_DESTRUCTIBLE = new Set(['wall', 'fortress', 'tower', 'aa']);
+    // Buildings become a PERSISTENT, REPAIRABLE ruin at 0 HP rather than
+    // vanishing — so a conqueror (or the owner) can rebuild them. The only
+    // exception is walls, which are a movement-blocking defensive line players
+    // expect to actually clear in a fight.
+    const STILL_DESTRUCTIBLE = new Set(['wall']);
     if (STILL_DESTRUCTIBLE.has(e.subtype)) {
       killEntity(e);
       return;
@@ -4593,6 +4607,32 @@ const NEAR_HELP_RADIUS = 6;       // tiles — local pickup for nearby work
 const NEAR_HELP_RADIUS_SQ = NEAR_HELP_RADIUS * NEAR_HELP_RADIUS;
 const REPAIR_HELP_RADIUS_SQ = 8 * 8; // slightly wider for damaged buildings
 
+// Begin (or resume) repairing a damaged OR destroyed building with `builder`.
+// Reviving a ruin (hp<=0) requires bumping hp above 0 and clearing the
+// `destroyed` flag — otherwise updateEntity's death branch intercepts the
+// building every frame and the rebuild can never progress (which also leaves
+// it stuck rendering as a construction scaffold, the "blank square" bug).
+function startRepair(building, builder) {
+  if (building.destroyed || building.hp <= 0) {
+    building.destroyed = false;
+    building.hp = Math.max(1, building.hp);
+    building._lastSmokeAt = 0;
+  }
+  building.underConstruction = true;
+  building._repairing = true;
+  building.buildProgress = building.buildTime * (building.hp / building.maxHp);
+  building.buildAssigned = builder;
+  if (builder) {
+    builder.buildJob = building;
+    builder.gathering = null;
+    builder.attackTarget = null;
+    builder.attackMove = false;
+    unassignWorker(builder);
+    builder._path = null;
+    builder.targetX = null; builder.targetY = null;
+  }
+}
+
 function reassignIdleBuilders() {
   // Find friendly buildings that need attention: unfinished construction or
   // damaged completed buildings. We do this for every owner (any player or
@@ -4655,11 +4695,7 @@ function reassignIdleBuilders() {
       if (d < bestD && d < repairRad) { best = b; bestD = d; }
     }
     if (best && !best.underConstruction) {
-      best.underConstruction = true;
-      best.buildProgress = best.buildTime * (best.hp / best.maxHp);
-      best._repairing = true;
-      best.buildAssigned = c;
-      c.buildJob = best;
+      startRepair(best, c);
     }
   }
 }
@@ -5166,7 +5202,6 @@ function setupGame(isClientMode = false) {
   // middle of a lake) the citizens would have nowhere to walk. If the
   // chosen tile fails the check we spiral outward to the nearest valid
   // tile so every player always starts on a viable peninsula or mainland.
-  const spawns = [];
   const cx = MAP_W / 2, cy = MAP_H / 2;
   const rMax = Math.min(MAP_W, MAP_H) * 0.42;
 
@@ -5208,14 +5243,30 @@ function setupGame(isClientMode = false) {
     return best || [tx, ty];
   }
 
-  for (let i = 0; i < N; i++) {
-    const ang = Math.PI + (i / N) * Math.PI * 2;
+  // Randomize the starting rotation each game so the host (and everyone else)
+  // doesn't always begin in the same place. Teammates are grouped into
+  // adjacent angular slots so allies generally spawn near one another, while
+  // opposing teams are spread around the map. Only the host runs this code;
+  // clients receive the resulting positions via the world snapshot, so the
+  // randomness can't desync.
+  const startAngle = Math.random() * Math.PI * 2;
+  // Order slot indices grouped by team (teammates contiguous), preserving the
+  // original slot order within each team.
+  const spawnOrder = slots.map((s, i) => i).sort((a, b) => {
+    const ta = slots[a].team, tb = slots[b].team;
+    if (ta !== tb) return ta - tb;
+    return a - b;
+  });
+  // spawns is indexed by SLOT index (later code reads spawns[i] per slot).
+  const spawns = new Array(N);
+  for (let k = 0; k < N; k++) {
+    const slotIdx = spawnOrder[k];
+    const ang = startAngle + (k / N) * Math.PI * 2;
     let sx = (cx + Math.cos(ang) * rMax) | 0;
     let sy = (cy + Math.sin(ang) * rMax) | 0;
     sx = Math.max(6, Math.min(MAP_W - 7, sx));
     sy = Math.max(6, Math.min(MAP_H - 7, sy));
-    const safe = findSafeSpawn(sx, sy);
-    spawns.push(safe);
+    spawns[slotIdx] = findSafeSpawn(sx, sy);
   }
 
   // Clear a generous building zone around each spawn: a 4-tile radius (an
@@ -5370,8 +5421,16 @@ function resize() {
   State.canvas.width = window.innerWidth;
   State.canvas.height = window.innerHeight;
   const mmRect = document.getElementById('minimap-wrap').getBoundingClientRect();
-  State.minimap.width = mmRect.width - 16;
-  State.minimap.height = mmRect.height - 16;
+  const dispW = mmRect.width - 16, dispH = mmRect.height - 16;
+  // Render the minimap at a higher backing resolution than its display size so
+  // it stays crisp and can show fine terrain detail. CSS keeps the on-screen
+  // size; the browser downsamples the larger buffer.
+  const MM_RES = 3;
+  State.minimap.style.width = dispW + 'px';
+  State.minimap.style.height = dispH + 'px';
+  State.minimap.width = Math.max(1, Math.round(dispW * MM_RES));
+  State.minimap.height = Math.max(1, Math.round(dispH * MM_RES));
+  State._mmLastBuilt = null; // force terrain layer rebuild at new resolution
 }
 
 // =================================================================
@@ -5588,6 +5647,15 @@ function onKeyDown(e) {
   // When paused, swallow all other game keys
   if (State.paused) return;
 
+  // Toggle cinematic graphics (bloom / grade / shadows). Useful if a player's
+  // machine struggles — turning it off reverts to the fast flat look.
+  if (e.code === 'KeyV') {
+    Render.enhanced = !Render.enhanced;
+    showMessage(Render.enhanced ? 'Cinematic graphics: ON' : 'Cinematic graphics: OFF (performance mode)', 'info');
+    e.preventDefault();
+    return;
+  }
+
   State.keys.add(e.code);
 
   // Modifier — Cmd on Mac, Ctrl elsewhere
@@ -5790,7 +5858,8 @@ function onKeyDown(e) {
 function onMinimapClick(e) {
   const rect = State.minimap.getBoundingClientRect();
   const mx = e.clientX - rect.left, my = e.clientY - rect.top;
-  const fx = mx / State.minimap.width, fy = my / State.minimap.height;
+  // Use the on-screen (display) size, not the higher-resolution backing buffer.
+  const fx = mx / rect.width, fy = my / rect.height;
   State.camera.x = fx * WORLD_W - State.canvas.width / 2;
   State.camera.y = fy * WORLD_H - State.canvas.height / 2;
 }
@@ -5867,6 +5936,8 @@ function handleRightClick(w, queueCmd, attackMove) {
 
   for (const u of sel) {
     if (u.type === 'building') {
+      // Only the building's owner may set its rally point.
+      if (u.owner !== HUMAN_ID) continue;
       // Set rally point. If the click landed on a resource or enemy, units trained here
       // pick up the appropriate task on spawn.
       u.rallyX = w.x; u.rallyY = w.y;
@@ -5926,18 +5997,11 @@ function handleRightClick(w, queueCmd, attackMove) {
         u._path = null;
         u.targetX = target.x; u.targetY = target.y;
         target.buildAssigned = u;
-      } else if (target.hp < target.maxHp && !target.underConstruction
+      } else if ((target.hp < target.maxHp || target.destroyed) && !target.underConstruction
                  && target.subtype !== 'city' && u.subtype === 'citizen') {
-        u.buildJob = target;
-        u.gathering = null;
-        u.attackTarget = null;
-        unassignWorker(u);
-        u.targetX = null; u.targetY = null;
-        // Mark it for repair so updateEntity's build-progress path applies
-        target.underConstruction = true;
-        target.buildProgress = target.buildTime * (target.hp / target.maxHp);
-        target.buildAssigned = u;
-        target._repairing = true;
+        // Repair (or rebuild a destroyed ruin). startRepair revives ruins so
+        // the rebuild actually progresses instead of sticking at 0 HP.
+        startRepair(target, u);
       } else if (target.workers !== undefined && u.subtype === 'citizen') {
         const ok = assignWorkerToWorkplace(u, target);
         if (!ok && u.owner === HUMAN_ID) {
@@ -6065,9 +6129,254 @@ function revealFog() {
 // =================================================================
 // RENDERING
 // =================================================================
+// =================================================================
+// VISUAL ENHANCEMENT MODULE — golden-hour lighting, baked terrain,
+// soft directional shadows, and cinematic post-processing.
+// All additive: touches rendering only, never game logic.
+// =================================================================
+const Render = {
+  // Master toggle (V key). When off, falls back to the plain look.
+  enhanced: true,
+  // Post-processing
+  bloom: true,
+  bloomScale: 0.28,      // resolution of the bloom buffer (fraction of screen)
+  bloomBlur: 5,          // blur radius applied in the small buffer
+  bloomStrength: 0.55,   // additive strength of the glow
+  colorGrade: true,
+  vignette: true,
+  // Sun direction (normalized-ish) for shading. NW sun => light from top-left,
+  // long shadows cast toward the south-east. Matches the golden-hour reference.
+  sunX: -0.6, sunY: -0.55,
+  // How long/strong cast shadows are
+  shadowLen: 0.5,
+  shadowAlpha: 0.34,
+};
+
+// Build a baked terrain tile atlas once. Each grass variant has sun-gradient
+// lighting, dappled meadow texture and tiny golden wildflowers baked in, so the
+// terrain reads as sunlit ground instead of flat color — and it's drawn with a
+// single fast drawImage per tile.
+function buildTerrainAtlas() {
+  const T = TILE;
+  const N = 8; // more grass variants to reduce visible repetition
+  const atlas = document.createElement('canvas');
+  atlas.width = T * (N + 2);
+  atlas.height = T;
+  const a = atlas.getContext('2d');
+  // Varied meadow greens — subtle base-color differences read as organic
+  // ground variation without any per-tile directional gradient (which causes
+  // visible diagonal seams when tiled).
+  const grassBases = ['#8ba872', '#90ab74', '#85a36d', '#94ae78', '#88a571', '#82a06a', '#8fad76', '#86a46f'];
+  for (let i = 0; i < N; i++) {
+    const ox = i * T;
+    a.fillStyle = grassBases[i];
+    a.fillRect(ox, 0, T, T);
+    // Low-contrast dappled shade + light blobs, positioned by a per-variant
+    // pseudo-random so no two tiles look alike. NO corner gradient.
+    let s = (i * 2654435761) >>> 0;
+    const rnd = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+    for (let b = 0; b < 3; b++) {
+      const bx = ox + 4 + rnd() * (T - 8), by = 4 + rnd() * (T - 8);
+      const br = 4 + rnd() * 5;
+      a.fillStyle = `rgba(70,100,60,${0.10 + rnd() * 0.08})`;
+      a.beginPath(); a.ellipse(bx, by, br, br * 0.7, 0, 0, Math.PI * 2); a.fill();
+    }
+    for (let b = 0; b < 2; b++) {
+      const bx = ox + 4 + rnd() * (T - 8), by = 4 + rnd() * (T - 8);
+      a.fillStyle = `rgba(180,208,140,${0.10 + rnd() * 0.08})`;
+      a.beginPath(); a.ellipse(bx, by, 3 + rnd() * 3, 2 + rnd() * 2, 0, 0, Math.PI * 2); a.fill();
+    }
+    // Sparse grass blades
+    a.strokeStyle = 'rgba(58,90,48,0.45)';
+    a.lineWidth = 1;
+    const blades = 3 + ((i) % 3);
+    for (let k = 0; k < blades; k++) {
+      const gx = ox + 4 + rnd() * (T - 8), gy = 6 + rnd() * (T - 10);
+      a.beginPath(); a.moveTo(gx, gy + 3); a.lineTo(gx + 0.4, gy);
+      a.moveTo(gx + 2, gy + 3); a.lineTo(gx + 2.3, gy - 1); a.stroke();
+    }
+    // Occasional tiny wildflower — rare, so it doesn't form a grid
+    if (rnd() < 0.5) {
+      a.fillStyle = rnd() < 0.5 ? 'rgba(245,222,120,0.8)' : 'rgba(250,245,235,0.7)';
+      a.fillRect(ox + 4 + rnd() * (T - 8), 4 + rnd() * (T - 8), 1.6, 1.6);
+    }
+  }
+  // Sand cell
+  const sandX = N * T;
+  a.fillStyle = '#d4b88a';
+  a.fillRect(sandX, 0, T, T);
+  a.fillStyle = 'rgba(190,160,110,0.25)';
+  let ss = 99; const srnd = () => { ss = (ss * 1664525 + 1013904223) >>> 0; return ss / 4294967296; };
+  for (let k = 0; k < 8; k++) a.fillRect(sandX + srnd() * T, srnd() * T, 2, 1);
+  // Water base cell (vertical depth gradient — tiles fine since water is a mass)
+  const waterX = (N + 1) * T;
+  const wg = a.createLinearGradient(waterX, 0, waterX, T);
+  wg.addColorStop(0, '#5686aa');
+  wg.addColorStop(1, '#37597a');
+  a.fillStyle = wg; a.fillRect(waterX, 0, T, T);
+
+  State._terrainAtlas = atlas;
+  State._atlasN = N;
+  State._atlasSandX = sandX;
+  State._atlasWaterX = waterX;
+}
+
+// Bake a soft round shadow sprite (radial gradient blob) once, so every entity
+// can stamp a soft, directional cast shadow with a single drawImage instead of
+// an expensive per-frame gradient.
+function buildShadowSprite() {
+  const S = 64;
+  const c = document.createElement('canvas');
+  c.width = S; c.height = S;
+  const x = c.getContext('2d');
+  const g = x.createRadialGradient(S / 2, S / 2, 1, S / 2, S / 2, S / 2);
+  g.addColorStop(0, 'rgba(0,0,0,0.85)');
+  g.addColorStop(0.55, 'rgba(0,0,0,0.45)');
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  x.fillStyle = g;
+  x.fillRect(0, 0, S, S);
+  State._shadowSprite = c;
+}
+
+// Draw a soft, directional cast shadow under an entity. (px,py) is the ground
+// anchor; w,h the footprint size in px. The shadow stretches toward SE (away
+// from the NW sun) and is squashed vertically to lie on the ground.
+function drawSoftShadow(px, py, w, h, alpha) {
+  if (!Render.enhanced || !State._shadowSprite) return;
+  const ctx = State.ctx;
+  const sx = w * (1.05 + Render.shadowLen * 0.4);
+  const sy = Math.max(6, h * 0.42);
+  const offX = w * 0.22, offY = h * 0.10;
+  ctx.save();
+  ctx.globalAlpha = alpha != null ? alpha : Render.shadowAlpha;
+  ctx.drawImage(State._shadowSprite, px - sx / 2 + offX, py - sy / 2 + offY, sx, sy);
+  ctx.restore();
+}
+
+// Cinematic post-processing: cheap bloom (downsample -> blur -> additive),
+// a golden-hour color grade (warm sky / cool shade) and a vignette. Applied to
+// the world canvas only; the minimap and DOM HUD are separate.
+function applyPostProcessing() {
+  if (!Render.enhanced) return;
+  const ctx = State.ctx, cv = State.canvas;
+  const w = cv.width, h = cv.height;
+
+  // ---- BLOOM ----
+  if (Render.bloom) {
+    const bw = Math.max(2, (w * Render.bloomScale) | 0);
+    const bh = Math.max(2, (h * Render.bloomScale) | 0);
+    if (!State._bloomA) { State._bloomA = document.createElement('canvas'); State._bloomActx = State._bloomA.getContext('2d'); }
+    if (!State._bloomB) { State._bloomB = document.createElement('canvas'); State._bloomBctx = State._bloomB.getContext('2d'); }
+    const A = State._bloomA, Ax = State._bloomActx;
+    const B = State._bloomB, Bx = State._bloomBctx;
+    if (A.width !== bw || A.height !== bh) { A.width = bw; A.height = bh; B.width = bw; B.height = bh; }
+    // Downsample the scene
+    Ax.globalCompositeOperation = 'source-over';
+    Ax.globalAlpha = 1; Ax.filter = 'none';
+    Ax.clearRect(0, 0, bw, bh);
+    Ax.drawImage(cv, 0, 0, bw, bh);
+    // Threshold: keep bright areas, crush mid/shadow (multiply by dark grey)
+    Ax.globalCompositeOperation = 'multiply';
+    Ax.fillStyle = 'rgb(96,96,96)';
+    Ax.fillRect(0, 0, bw, bh);
+    Ax.globalCompositeOperation = 'source-over';
+    // Blur the small buffer into B (cheap because it's tiny)
+    Bx.clearRect(0, 0, bw, bh);
+    Bx.filter = `blur(${Render.bloomBlur}px)`;
+    Bx.drawImage(A, 0, 0);
+    Bx.filter = 'none';
+    // Composite the glow back additively at full res
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = Render.bloomStrength;
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(B, 0, 0, w, h);
+    ctx.restore();
+  }
+
+  // ---- COLOR GRADE (golden hour) ----
+  if (Render.colorGrade) {
+    // Large-scale directional sunlight: a broad warm wash from the NW (sun
+    // side) fading to cool shade in the SE. Applied at screen scale so it
+    // reads as global lighting with zero tiling seams.
+    ctx.save();
+    ctx.globalCompositeOperation = 'soft-light';
+    const sun = ctx.createLinearGradient(0, 0, w, h);
+    sun.addColorStop(0, 'rgba(255,214,150,0.42)');   // warm sunlit NW
+    sun.addColorStop(0.55, 'rgba(255,235,200,0.10)');
+    sun.addColorStop(1, 'rgba(48,68,110,0.34)');     // cool shade SE
+    ctx.fillStyle = sun;
+    ctx.fillRect(0, 0, w, h);
+    // A gentle overall warmth
+    ctx.globalCompositeOperation = 'overlay';
+    ctx.fillStyle = 'rgba(255,170,92,0.07)';
+    ctx.fillRect(0, 0, w, h);
+    ctx.restore();
+  }
+
+  // ---- VIGNETTE ----
+  if (Render.vignette) {
+    ctx.save();
+    const vg = ctx.createRadialGradient(w / 2, h * 0.46, Math.min(w, h) * 0.28, w / 2, h * 0.5, Math.max(w, h) * 0.72);
+    vg.addColorStop(0, 'rgba(0,0,0,0)');
+    vg.addColorStop(0.7, 'rgba(0,0,0,0.10)');
+    vg.addColorStop(1, 'rgba(0,0,0,0.46)');
+    ctx.fillStyle = vg;
+    ctx.fillRect(0, 0, w, h);
+    ctx.restore();
+  }
+}
+
+// Ensure render atlases are built (idempotent, cheap guard).
+function ensureRenderAssets() {
+  if (!State._terrainAtlas) buildTerrainAtlas();
+  if (!State._shadowSprite) buildShadowSprite();
+}
+
+// Ambient occlusion at terrain seams: where a grass tile borders water or
+// mountain, lay a soft dark gradient strip along that edge so elevation/water
+// changes feel grounded instead of flat. Cheap: only runs on boundary tiles.
+function drawTileEdgeAO(x, y, px, py) {
+  const ctx = State.ctx;
+  const isShade = (tx, ty) => {
+    if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) return false;
+    const tt = State.map[ty][tx];
+    return tt === TERRAIN.WATER || tt === TERRAIN.MOUNTAIN;
+  };
+  const T = TILE;
+  ctx.save();
+  ctx.globalCompositeOperation = 'multiply';
+  // North
+  if (isShade(x, y - 1)) {
+    const g = ctx.createLinearGradient(0, py, 0, py + 8);
+    g.addColorStop(0, 'rgba(70,80,70,0.55)'); g.addColorStop(1, 'rgba(70,80,70,0)');
+    ctx.fillStyle = g; ctx.fillRect(px, py, T, 8);
+  }
+  // West
+  if (isShade(x - 1, y)) {
+    const g = ctx.createLinearGradient(px, 0, px + 8, 0);
+    g.addColorStop(0, 'rgba(70,80,70,0.55)'); g.addColorStop(1, 'rgba(70,80,70,0)');
+    ctx.fillStyle = g; ctx.fillRect(px, py, 8, T);
+  }
+  // East
+  if (isShade(x + 1, y)) {
+    const g = ctx.createLinearGradient(px + T, 0, px + T - 8, 0);
+    g.addColorStop(0, 'rgba(70,80,70,0.55)'); g.addColorStop(1, 'rgba(70,80,70,0)');
+    ctx.fillStyle = g; ctx.fillRect(px + T - 8, py, 8, T);
+  }
+  // South
+  if (isShade(x, y + 1)) {
+    const g = ctx.createLinearGradient(0, py + T, 0, py + T - 8);
+    g.addColorStop(0, 'rgba(70,80,70,0.55)'); g.addColorStop(1, 'rgba(70,80,70,0)');
+    ctx.fillStyle = g; ctx.fillRect(px, py + T - 8, T, 8);
+  }
+  ctx.restore();
+}
+
 function render() {
   const ctx = State.ctx;
   const cv = State.canvas;
+  ensureRenderAssets();
   ctx.fillStyle = '#1a1410';
   ctx.fillRect(0, 0, cv.width, cv.height);
 
@@ -6077,49 +6386,73 @@ function render() {
   const x1 = Math.min(MAP_W, ((State.camera.x + cv.width) / TILE | 0) + 1);
   const y1 = Math.min(MAP_H, ((State.camera.y + cv.height) / TILE | 0) + 1);
 
+  const atlas = State._terrainAtlas;
+  const aN = State._atlasN;
+  const useAtlas = Render.enhanced && atlas;
+
   // Terrain
   for (let y = y0; y < y1; y++) {
     for (let x = x0; x < x1; x++) {
       const px = x * TILE - State.camera.x;
       const py = y * TILE - State.camera.y;
       const t = State.map[y][x];
-      ctx.fillStyle = TERRAIN_COLORS[t];
-      ctx.fillRect(px, py, TILE, TILE);
       const seed = (x * 73856093) ^ (y * 19349663); // stable per-tile hash
 
+      if (useAtlas && (t === TERRAIN.GRASS || t === TERRAIN.MOUNTAIN || t === TERRAIN.GOLD)) {
+        // Sunlit grass base (mountains/gold nodes sit on grass). Flip the tile
+        // horizontally/vertically by seed bits so the texture never visibly
+        // repeats in a grid.
+        const variant = (seed >>> 0) % aN;
+        const fx = (seed >> 8) & 1, fy = (seed >> 9) & 1;
+        if (fx || fy) {
+          ctx.save();
+          ctx.translate(px + TILE / 2, py + TILE / 2);
+          ctx.scale(fx ? -1 : 1, fy ? -1 : 1);
+          ctx.drawImage(atlas, variant * TILE, 0, TILE, TILE, -TILE / 2, -TILE / 2, TILE, TILE);
+          ctx.restore();
+        } else {
+          ctx.drawImage(atlas, variant * TILE, 0, TILE, TILE, px, py, TILE, TILE);
+        }
+      } else if (useAtlas && t === TERRAIN.SAND) {
+        ctx.drawImage(atlas, State._atlasSandX, 0, TILE, TILE, px, py, TILE, TILE);
+      } else if (useAtlas && t === TERRAIN.WATER) {
+        ctx.drawImage(atlas, State._atlasWaterX, 0, TILE, TILE, px, py, TILE, TILE);
+      } else {
+        ctx.fillStyle = TERRAIN_COLORS[t];
+        ctx.fillRect(px, py, TILE, TILE);
+      }
+
       if (t === TERRAIN.GRASS) {
-        // Dappled lighter/darker patches for texture
-        const v = ((seed >>> 0) % 7);
-        if (v === 0) {
-          ctx.fillStyle = 'rgba(132, 158, 100, 0.55)';
-          ctx.fillRect(px + 4, py + 6, TILE - 10, TILE - 12);
-        } else if (v === 1) {
-          ctx.fillStyle = 'rgba(90, 116, 70, 0.45)';
-          ctx.fillRect(px + 8, py + 4, 12, 8);
-        }
-        // Occasional grass tuft
-        if (v === 2) {
-          ctx.fillStyle = 'rgba(60, 92, 50, 0.7)';
-          for (let i = 0; i < 3; i++) {
-            const gx = px + 6 + i * 8, gy = py + 18 + ((seed >>> (i+2)) & 3);
-            ctx.fillRect(gx, gy, 1, 3);
-            ctx.fillRect(gx + 1, gy - 1, 1, 4);
+        if (!useAtlas) {
+          // Legacy dappled texture (only when enhanced look is off)
+          const v = ((seed >>> 0) % 7);
+          if (v === 0) { ctx.fillStyle = 'rgba(132, 158, 100, 0.55)'; ctx.fillRect(px + 4, py + 6, TILE - 10, TILE - 12); }
+          else if (v === 1) { ctx.fillStyle = 'rgba(90, 116, 70, 0.45)'; ctx.fillRect(px + 8, py + 4, 12, 8); }
+          if (v === 2) {
+            ctx.fillStyle = 'rgba(60, 92, 50, 0.7)';
+            for (let i = 0; i < 3; i++) { const gx = px + 6 + i * 8, gy = py + 18 + ((seed >>> (i+2)) & 3); ctx.fillRect(gx, gy, 1, 3); ctx.fillRect(gx + 1, gy - 1, 1, 4); }
           }
+          if (v === 5) { ctx.fillStyle = 'rgba(80, 70, 60, 0.6)'; ctx.fillRect(px + 12 + ((seed >>> 3) & 7), py + 12 + ((seed >>> 6) & 7), 2, 2); }
         }
-        // Tiny pebble
-        if (v === 5) {
-          ctx.fillStyle = 'rgba(80, 70, 60, 0.6)';
-          ctx.fillRect(px + 12 + ((seed >>> 3) & 7), py + 12 + ((seed >>> 6) & 7), 2, 2);
-        }
+        // Edge ambient occlusion: darken grass where it meets water/mountain
+        if (useAtlas) drawTileEdgeAO(x, y, px, py);
       } else if (t === TERRAIN.WATER) {
-        // Layered ripples for sense of depth
-        ctx.fillStyle = 'rgba(20, 50, 80, 0.35)';
+        // Layered ripples for sense of depth (animated; drawn over the base)
+        ctx.fillStyle = 'rgba(20, 50, 80, 0.30)';
         ctx.fillRect(px, py + TILE - 4, TILE, 4);
         for (let i = 0; i < 2; i++) {
           const phase = (State.time * 1.3 + (seed >>> (i * 4)) * 0.01) % 1;
           const yLine = py + 6 + i * 14 + Math.sin(State.time * 1.2 + x * 0.6 + y * 0.4 + i) * 1.5;
-          ctx.fillStyle = `rgba(220,235,245,${0.10 + (1-phase) * 0.10})`;
+          ctx.fillStyle = `rgba(220,235,245,${0.10 + (1-phase) * 0.12})`;
           ctx.fillRect(px + 4, yLine, TILE - 8, 1);
+        }
+        // Sun glint sparkle
+        if (useAtlas) {
+          const tw = (Math.sin(State.time * 2.4 + seed) * 0.5 + 0.5);
+          if (tw > 0.72) {
+            ctx.fillStyle = `rgba(255,250,225,${(tw - 0.72) * 1.8})`;
+            ctx.fillRect(px + 8 + (seed & 15), py + 8 + ((seed >> 4) & 15), 2, 1);
+          }
         }
       } else if (t === TERRAIN.MOUNTAIN) {
         // Slopy peak with western highlight (light from NW)
@@ -6146,15 +6479,22 @@ function render() {
         ctx.lineTo(px + TILE/2 - 6, py + 13);
         ctx.closePath();
         ctx.fill();
+        // Warm sun rim on the snow cap
+        if (useAtlas) {
+          ctx.fillStyle = 'rgba(255,220,150,0.5)';
+          ctx.beginPath();
+          ctx.moveTo(px + TILE/2, py + 3);
+          ctx.lineTo(px + TILE/2 - 4, py + 9);
+          ctx.lineTo(px + TILE/2 - 1, py + 9);
+          ctx.closePath();
+          ctx.fill();
+        }
         // Dark shadow base
         ctx.fillStyle = 'rgba(0,0,0,0.25)';
         ctx.fillRect(px + 3, py + TILE - 5, TILE - 6, 3);
-      } else if (t === TERRAIN.SAND) {
+      } else if (t === TERRAIN.SAND && !useAtlas) {
         const v = ((seed >>> 0) % 5);
-        if (v === 0) {
-          ctx.fillStyle = 'rgba(220, 200, 150, 0.6)';
-          ctx.fillRect(px + 6, py + 10, 8, 4);
-        }
+        if (v === 0) { ctx.fillStyle = 'rgba(220, 200, 150, 0.6)'; ctx.fillRect(px + 6, py + 10, 8, 4); }
         ctx.fillStyle = 'rgba(140, 110, 70, 0.4)';
         ctx.fillRect(px + 4 + ((seed >>> 2) & 11), py + 18 + ((seed >>> 4) & 7), 2, 1);
       }
@@ -6266,6 +6606,10 @@ function render() {
     ctx.stroke();
   }
 
+  // Cinematic post-processing — bloom, golden-hour grade, vignette.
+  // Applied over the world + effects, before the minimap (separate canvas).
+  applyPostProcessing();
+
   // Draw minimap
   drawMinimap();
 
@@ -6304,36 +6648,62 @@ function drawResourceNode(e) {
   const px = e.x * TILE - State.camera.x;
   const py = e.y * TILE - State.camera.y;
   if (e.subtype === 'forest') {
-    // Soft ground shadow
-    ctx.fillStyle = 'rgba(0,0,0,0.28)';
-    ctx.beginPath();
-    ctx.ellipse(px + 2, py + 10, 10, 3, 0, 0, Math.PI*2);
-    ctx.fill();
+    // Gentle per-tree sway (stable phase from position)
+    const sway = Render.enhanced ? Math.sin(State.time * 1.3 + e.x * 0.7 + e.y * 0.5) * 1.2 : 0;
+    // Soft directional ground shadow
+    if (Render.enhanced && State._shadowSprite) {
+      drawSoftShadow(px + 3, py + 10, 24, 9, 0.30);
+    } else {
+      ctx.fillStyle = 'rgba(0,0,0,0.28)';
+      ctx.beginPath();
+      ctx.ellipse(px + 2, py + 10, 10, 3, 0, 0, Math.PI*2);
+      ctx.fill();
+    }
     // Trunk
     ctx.fillStyle = '#3a2818';
     ctx.fillRect(px - 2, py + 1, 4, 9);
     ctx.fillStyle = '#5a3a22';
     ctx.fillRect(px - 2, py + 1, 1, 9);
-    // Multi-layer canopy
-    ctx.fillStyle = '#1f4a2a';
-    ctx.beginPath();
-    ctx.arc(px, py - 1, 11, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#3a6e44';
-    ctx.beginPath();
-    ctx.arc(px - 2, py - 3, 9, 0, Math.PI * 2);
-    ctx.fill();
-    // Highlight blob
-    ctx.fillStyle = '#5a8a5a';
-    ctx.beginPath();
-    ctx.arc(px - 4, py - 6, 5, 0, Math.PI * 2);
-    ctx.fill();
-    // Tiny dapples
-    ctx.fillStyle = 'rgba(150, 200, 130, 0.55)';
-    ctx.beginPath();
-    ctx.arc(px - 5, py - 7, 1.5, 0, Math.PI * 2);
-    ctx.arc(px + 3, py - 4, 1.2, 0, Math.PI * 2);
-    ctx.fill();
+    if (Render.enhanced) {
+      // Voluminous multi-lobe canopy with depth shading and warm rim light.
+      const cx = px + sway, cy = py - 1;
+      // Deep shadow underside
+      ctx.fillStyle = '#173d22';
+      ctx.beginPath();
+      ctx.arc(cx + 2, cy + 2, 12, 0, Math.PI * 2);
+      ctx.fill();
+      // Mid green mass (several overlapping lobes)
+      ctx.fillStyle = '#2c5a38';
+      for (const [ox, oy, r] of [[-5, 1, 8], [5, 1, 8], [0, -4, 9], [-3, -1, 8], [3, -2, 7]]) {
+        ctx.beginPath(); ctx.arc(cx + ox, cy + oy, r, 0, Math.PI * 2); ctx.fill();
+      }
+      // Lit green (sun from NW -> upper-left lobes brighter)
+      ctx.fillStyle = '#4c8350';
+      for (const [ox, oy, r] of [[-4, -3, 6], [1, -5, 6], [-1, -1, 5]]) {
+        ctx.beginPath(); ctx.arc(cx + ox, cy + oy, r, 0, Math.PI * 2); ctx.fill();
+      }
+      // Bright highlight crowns
+      ctx.fillStyle = '#74ab6c';
+      ctx.beginPath(); ctx.arc(cx - 4, cy - 5, 3.6, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx, cy - 6, 2.6, 0, Math.PI * 2); ctx.fill();
+      // Warm golden-hour rim on the sunlit edge
+      ctx.strokeStyle = 'rgba(255,230,160,0.5)';
+      ctx.lineWidth = 1.4;
+      ctx.beginPath(); ctx.arc(cx - 3, cy - 4, 9.5, Math.PI * 1.05, Math.PI * 1.7); ctx.stroke();
+      // Leaf dapples
+      ctx.fillStyle = 'rgba(190,225,150,0.6)';
+      ctx.beginPath(); ctx.arc(cx - 5, cy - 6, 1.3, 0, Math.PI * 2); ctx.arc(cx + 3, cy - 3, 1.1, 0, Math.PI * 2); ctx.arc(cx - 1, cy - 1, 1, 0, Math.PI * 2); ctx.fill();
+    } else {
+      // Legacy canopy
+      ctx.fillStyle = '#1f4a2a';
+      ctx.beginPath(); ctx.arc(px, py - 1, 11, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#3a6e44';
+      ctx.beginPath(); ctx.arc(px - 2, py - 3, 9, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#5a8a5a';
+      ctx.beginPath(); ctx.arc(px - 4, py - 6, 5, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = 'rgba(150, 200, 130, 0.55)';
+      ctx.beginPath(); ctx.arc(px - 5, py - 7, 1.5, 0, Math.PI * 2); ctx.arc(px + 3, py - 4, 1.2, 0, Math.PI * 2); ctx.fill();
+    }
   } else if (e.subtype === 'gold') {
     // Rocky mound base
     ctx.fillStyle = 'rgba(0,0,0,0.28)';
@@ -6482,6 +6852,188 @@ function drawTeamPennant(ctx, player, cx, cy, poleH, flagW) {
   ctx.stroke();
 }
 
+// =================================================================
+// 3D BUILDING PRIMITIVES — compose characterful, non-boxy structures.
+// Sun is NW: left/top faces are lit, right/bottom faces are shaded.
+// All coords screen-space. Buildings rise UPWARD from their footprint base.
+// =================================================================
+function _shade(hex, amt) {
+  // amt < 1 darkens, > 1 lightens
+  const n = parseInt(hex.slice(1), 16);
+  let r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+  r = Math.max(0, Math.min(255, Math.round(r * amt)));
+  g = Math.max(0, Math.min(255, Math.round(g * amt)));
+  b = Math.max(0, Math.min(255, Math.round(b * amt)));
+  return `rgb(${r},${g},${b})`;
+}
+
+function roundRectPath(ctx, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+// Team-colored ground plot the building sits on. Subtle tinted footprint +
+// crisp colored outline, drawn on the GROUND before the building art, so the
+// structure can rise above the footprint and still read as owned without a box
+// cutting across its silhouette.
+function drawOwnerPlot(px, py, w, h, player) {
+  if (!player) return;
+  const ctx = State.ctx;
+  const col = player.colorBright || player.color || '#888';
+  ctx.save();
+  ctx.globalAlpha = 0.12;
+  ctx.fillStyle = col;
+  roundRectPath(ctx, px + 1.5, py + 1.5, w - 3, h - 3, 5);
+  ctx.fill();
+  ctx.globalAlpha = 0.5;
+  ctx.lineWidth = 2.6;
+  ctx.strokeStyle = 'rgba(8,5,3,0.45)';
+  roundRectPath(ctx, px + 1.5, py + 1.5, w - 3, h - 3, 5);
+  ctx.stroke();
+  ctx.globalAlpha = 0.5;
+  ctx.lineWidth = 1.4;
+  ctx.strokeStyle = col;
+  roundRectPath(ctx, px + 1.5, py + 1.5, w - 3, h - 3, 5);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Base ownership accents drawn AFTER art: a colored ribbon along the front
+// (bottom) edge plus small corner posts at the footprint corners. Always
+// visible, never cuts across a tall building.
+function drawOwnerBaseAccent(px, py, w, h, player, isRuin) {
+  if (!player) return;
+  const ctx = State.ctx;
+  const col = player.colorBright || player.color || '#888';
+  // Front ribbon
+  ctx.fillStyle = 'rgba(8,5,3,0.6)';
+  ctx.fillRect(px + 3, py + h - 2.5, w - 6, 3.5);
+  ctx.fillStyle = col;
+  ctx.globalAlpha = isRuin ? 0.95 : 0.9;
+  ctx.fillRect(px + 4, py + h - 2, w - 8, 2.2);
+  ctx.globalAlpha = 1;
+  // Corner posts (small, on the ground)
+  const posts = [[px + 2, py + 2], [px + w - 4, py + 2], [px + 2, py + h - 4], [px + w - 4, py + h - 4]];
+  for (const [qx, qy] of posts) {
+    ctx.fillStyle = 'rgba(8,5,3,0.55)';
+    ctx.fillRect(qx - 0.5, qy - 0.5, 3, 3);
+    ctx.fillStyle = col;
+    ctx.fillRect(qx, qy, 2, 2);
+  }
+}
+
+// Vertical box with a flat top. Bottom-left at (x, baseY); rises `bodyH` up.
+// Returns the top y. col = base hex color.
+function prim_box(x, baseY, bw, bodyH, col, opt) {
+  opt = opt || {};
+  const ctx = State.ctx;
+  const topY = baseY - bodyH;
+  ctx.fillStyle = col;
+  ctx.fillRect(x, topY, bw, bodyH);
+  // lit left
+  ctx.fillStyle = `rgba(255,250,235,${opt.lit != null ? opt.lit : 0.15})`;
+  ctx.fillRect(x, topY, Math.max(2, bw * 0.18), bodyH);
+  // shadow right
+  ctx.fillStyle = `rgba(0,0,0,${opt.shade != null ? opt.shade : 0.22})`;
+  ctx.fillRect(x + bw - Math.max(2, bw * 0.16), topY, Math.max(2, bw * 0.16), bodyH);
+  // top cap highlight
+  ctx.fillStyle = 'rgba(255,250,235,0.20)';
+  ctx.fillRect(x, topY, bw, 1.6);
+  return topY;
+}
+
+// Pitched gable roof on a box of width bw whose top is at y=topY.
+function prim_gable(x, topY, bw, riseH, col, hiCol) {
+  const ctx = State.ctx;
+  ctx.fillStyle = col;
+  ctx.beginPath();
+  ctx.moveTo(x - 1.5, topY + 1.5);
+  ctx.lineTo(x + bw / 2, topY - riseH);
+  ctx.lineTo(x + bw + 1.5, topY + 1.5);
+  ctx.closePath();
+  ctx.fill();
+  // sunlit left slope
+  ctx.fillStyle = hiCol;
+  ctx.beginPath();
+  ctx.moveTo(x - 1.5, topY + 1.5);
+  ctx.lineTo(x + bw / 2, topY - riseH);
+  ctx.lineTo(x + bw / 2 - 2.5, topY - riseH + 3.5);
+  ctx.lineTo(x + 3, topY + 1.5);
+  ctx.closePath();
+  ctx.fill();
+  // ridge shadow on right slope
+  ctx.fillStyle = 'rgba(0,0,0,0.12)';
+  ctx.beginPath();
+  ctx.moveTo(x + bw / 2, topY - riseH);
+  ctx.lineTo(x + bw + 1.5, topY + 1.5);
+  ctx.lineTo(x + bw - 2, topY + 1.5);
+  ctx.lineTo(x + bw / 2 + 1.5, topY - riseH + 3);
+  ctx.closePath();
+  ctx.fill();
+}
+
+// Conical roof for a round tower; apex above (cx, topY).
+function prim_cone(cx, topY, r, hgt, col, hiCol) {
+  const ctx = State.ctx;
+  ctx.fillStyle = col;
+  ctx.beginPath();
+  ctx.moveTo(cx - r, topY);
+  ctx.lineTo(cx, topY - hgt);
+  ctx.lineTo(cx + r, topY);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = hiCol;
+  ctx.beginPath();
+  ctx.moveTo(cx - r, topY);
+  ctx.lineTo(cx, topY - hgt);
+  ctx.lineTo(cx - 1.5, topY);
+  ctx.closePath();
+  ctx.fill();
+}
+
+// Crenellated battlement strip across the top of a box.
+function prim_crenels(x, topY, bw, mh, col) {
+  const ctx = State.ctx;
+  const mw = 4, gap = 3;
+  let cx = x;
+  while (cx + mw <= x + bw) {
+    ctx.fillStyle = col;
+    ctx.fillRect(cx, topY - mh, mw, mh);
+    ctx.fillStyle = 'rgba(255,250,235,0.16)';
+    ctx.fillRect(cx, topY - mh, mw, 1.2);
+    cx += mw + gap;
+  }
+}
+
+// A round tower: cylindrical body (with curved shading) + battlement ring.
+function prim_round_tower(cx, baseY, r, bodyH, col) {
+  const ctx = State.ctx;
+  const topY = baseY - bodyH;
+  // body
+  ctx.fillStyle = col;
+  ctx.fillRect(cx - r, topY, r * 2, bodyH);
+  // curved shading: light center-left, dark right
+  const g = ctx.createLinearGradient(cx - r, 0, cx + r, 0);
+  g.addColorStop(0, 'rgba(255,250,235,0.10)');
+  g.addColorStop(0.35, 'rgba(255,250,235,0.20)');
+  g.addColorStop(0.6, 'rgba(0,0,0,0)');
+  g.addColorStop(1, 'rgba(0,0,0,0.28)');
+  ctx.fillStyle = g;
+  ctx.fillRect(cx - r, topY, r * 2, bodyH);
+  // rounded top rim
+  ctx.fillStyle = _shade(col, 1.12);
+  ctx.beginPath();
+  ctx.ellipse(cx, topY, r, r * 0.4, 0, 0, Math.PI * 2);
+  ctx.fill();
+  return topY;
+}
+
 function drawBuilding(e) {
   const ctx = State.ctx;
   const px = e.tx * TILE - State.camera.x;
@@ -6497,22 +7049,24 @@ function drawBuilding(e) {
     ctx.shadowBlur = 12;
   }
 
-  // Soft ground shadow (offset southeast)
-  ctx.fillStyle = 'rgba(0,0,0,0.32)';
-  ctx.beginPath();
-  ctx.ellipse(px + w/2 + 4, py + h - 2, w/2 - 2, 6, 0, 0, Math.PI*2);
-  ctx.fill();
-
-  // Team-color border drawn BEFORE the per-type art as a base layer.
-  // We also draw a stronger one AFTER all art (including the destroyed
-  // overlay) so it's always visible — see the matching block at the bottom.
-  if (player && !e.underConstruction) {
-    const stripeColor = player.colorBright || player.color || '#888';
-    ctx.fillStyle = stripeColor;
-    ctx.globalAlpha = 0.85;
-    ctx.fillRect(px + 3, py + h - 1, w - 6, 3);
-    ctx.globalAlpha = 1.0;
+  // Soft directional ground shadow (golden-hour, cast toward SE)
+  if (Render.enhanced && State._shadowSprite) {
+    drawSoftShadow(px + w / 2, py + h - 2, w + 6, h * 0.55, 0.36);
+  } else {
+    ctx.fillStyle = 'rgba(0,0,0,0.32)';
+    ctx.beginPath();
+    ctx.ellipse(px + w/2 + 4, py + h - 2, w/2 - 2, 6, 0, 0, Math.PI*2);
+    ctx.fill();
   }
+
+  // Team-colored ground plot the structure sits on (lets buildings rise above
+  // their footprint while staying clearly owned). Tracks the highest y the art
+  // reaches so status bars can float above tall silhouettes.
+  if (!e.underConstruction) drawOwnerPlot(px, py, w, h, player);
+  e._topY = py;
+
+  // (Ownership is shown by the ground plot above and the base accent below;
+  // the old bottom stripe here was redundant and has been removed.)
 
   if (e.underConstruction) {
     // Scaffolding & exposed timber
@@ -6559,11 +7113,12 @@ function drawBuilding(e) {
   // and overlay damage afterward. We do this with a save/restore so the
   // per-type branches don't need to know about the destroyed state.
   if (e.destroyed) {
+    // Fade the normal art; a charred/scorch overlay is layered on AFTER the
+    // art (see below). We avoid ctx.filter here so the ruin renders correctly
+    // on every browser/renderer — the post-art overlay supplies the "burnt"
+    // look instead of a filter that some environments ignore.
     ctx.save();
-    ctx.globalAlpha = 0.55;
-    // Use composite to darken — most building art uses solid fills, so a
-    // multiply blend tints them all toward dark grey/brown.
-    ctx.filter = 'brightness(0.55) saturate(0.4) sepia(0.3)';
+    ctx.globalAlpha = 0.62;
   }
 
   // ============= FAUX-3D BUILDING =============
@@ -6576,388 +7131,399 @@ function drawBuilding(e) {
 
   // ---- per-type details ----
   if (e.subtype === 'city') {
-    // Sandstone keep
-    const wallTop = '#c8b288';   // sunlit
-    const wallBot = '#8a7050';   // shadow side
-    // South wall (the depth band)
-    ctx.fillStyle = wallBot;
-    ctx.fillRect(px + 2, py + h - depth, w - 4, depth);
-    // Main body
-    ctx.fillStyle = wallTop;
-    ctx.fillRect(px + 2, py + 4, w - 4, h - 4 - depth);
-    // North/west highlight
-    ctx.fillStyle = 'rgba(255,250,235,0.18)';
-    ctx.fillRect(px + 2, py + 4, w - 4, 3);
-    ctx.fillRect(px + 2, py + 4, 3, h - 4 - depth);
-    // East shadow
-    ctx.fillStyle = 'rgba(0,0,0,0.18)';
-    ctx.fillRect(px + w - 5, py + 4, 3, h - 4 - depth);
-    // Crenellations along the top
-    ctx.fillStyle = wallTop;
-    for (let i = 0; i < 5; i++) {
-      const cx = px + 4 + i * (w - 12) / 4;
-      ctx.fillRect(cx, py - 2, 4, 6);
-    }
-    // Big gate
-    ctx.fillStyle = '#3a2a18';
-    ctx.fillRect(px + w/2 - 6, py + h - depth - 14, 12, 14);
-    ctx.fillStyle = '#5a3e22';
-    ctx.fillRect(px + w/2 - 5, py + h - depth - 12, 10, 12);
-    // Reinforcing bands
-    ctx.strokeStyle = '#1a1410';
-    ctx.lineWidth = 1.2;
-    ctx.beginPath();
-    ctx.moveTo(px + w/2 - 5, py + h - depth - 8); ctx.lineTo(px + w/2 + 5, py + h - depth - 8);
-    ctx.moveTo(px + w/2 - 5, py + h - depth - 4); ctx.lineTo(px + w/2 + 5, py + h - depth - 4);
-    ctx.stroke();
+    // Era-aware capital: a composed silhouette, not a single box. Ancient =
+    // timber hall + huts; Medieval = stone castle w/ towers; Industrial+ =
+    // brick town skyline w/ clock tower & smokestack.
+    const era = player ? (player.age || 0) : 0;
+    const baseY = py + h - 2;
+    const cxc = px + w / 2;
 
-    // === HEAVY TEAM HERALDRY ===
-    // Two hanging banners flanking the gate. Each banner is a vertical
-    // rectangle in the player's color with a darker outline and a small
-    // V-cut at the bottom for the medieval-flag look.
-    const bannerW = 5, bannerH = 16;
-    const gateMidY = py + h - depth - 14;
-    const drawHangingBanner = (bx) => {
-      // Pole horizontal arm
-      ctx.strokeStyle = '#3a2a1a';
-      ctx.lineWidth = 1.5;
+    if (era <= 1) {
+      // ---- ANCIENT / CLASSICAL — timber & stone settlement ----
+      // Flanking huts
+      let t1 = prim_box(px + 5, baseY, 24, 20, '#bda774', {});
+      prim_gable(px + 5, t1, 24, 13, '#6f4d2f', '#8c6438');
+      let t2 = prim_box(px + w - 30, baseY - 3, 25, 18, '#b39c69', {});
+      prim_gable(px + w - 30, t2, 25, 12, '#6f4d2f', '#8c6438');
+      // Central great hall (tallest)
+      const hw = 42, hx = cxc - hw / 2;
+      let th = prim_box(hx, baseY - 1, hw, 32, '#ccb68c', {});
+      // front columns
+      ctx.fillStyle = 'rgba(60,40,24,0.35)';
+      for (let i = 0; i < 4; i++) ctx.fillRect(hx + 5 + i * (hw - 10) / 3, th + 2, 2.5, baseY - 1 - (th + 2));
+      // big thatched roof
+      prim_gable(hx - 3, th, hw + 6, 19, '#7a4a2a', '#9c6638');
+      ctx.strokeStyle = 'rgba(40,25,12,0.4)'; ctx.lineWidth = 1;
+      for (let i = 1; i < 4; i++) { const yy = th - i * 19 / 4.5; ctx.beginPath(); ctx.moveTo(hx + 4, yy); ctx.lineTo(hx + hw - 4, yy); ctx.stroke(); }
+      // door
+      ctx.fillStyle = '#2a1c10'; ctx.fillRect(cxc - 5, baseY - 15, 10, 13);
+      ctx.fillStyle = '#5a3e22'; ctx.fillRect(cxc - 4, baseY - 14, 8, 12);
+      e._topY = th - 19;
+      drawTeamPennant(ctx, player, cxc, th - 18, 16, 11);
+    } else if (era <= 3) {
+      // ---- MEDIEVAL / GUNPOWDER — stone castle ----
+      const sCol = '#b3a07e';
+      // Curtain wall across the back
+      let wt = prim_box(px + 6, baseY - 6, w - 12, 22, sCol, {});
+      prim_crenels(px + 6, wt, w - 12, 6, sCol);
+      // Gate in the curtain wall
+      ctx.fillStyle = '#2a1c10';
       ctx.beginPath();
-      ctx.moveTo(bx - 1, gateMidY - 1);
-      ctx.lineTo(bx + bannerW + 1, gateMidY - 1);
-      ctx.stroke();
-      // Banner cloth
-      ctx.fillStyle = player.color;
-      ctx.fillRect(bx, gateMidY, bannerW, bannerH);
-      ctx.fillStyle = player.colorBright;
-      ctx.fillRect(bx, gateMidY, bannerW, 2);
-      // V-cut bottom (carved into the banner)
-      ctx.fillStyle = wallTop; // match wall behind it
-      ctx.beginPath();
-      ctx.moveTo(bx, gateMidY + bannerH);
-      ctx.lineTo(bx + bannerW / 2, gateMidY + bannerH - 3);
-      ctx.lineTo(bx + bannerW, gateMidY + bannerH);
-      ctx.closePath();
-      ctx.fill();
-      // Banner outline
-      ctx.strokeStyle = player.colorBright;
-      ctx.lineWidth = 0.8;
-      ctx.strokeRect(bx, gateMidY, bannerW, bannerH);
-    };
-    drawHangingBanner(px + w/2 - 14);
-    drawHangingBanner(px + w/2 + 9);
-
-    // Main banner on a tall pole atop the keep — bigger and more elaborate
-    // than before. Pennant shape with a colored shield emblem in the centre
-    // that uses the player's bright color for contrast.
-    ctx.strokeStyle = '#3a2a1a';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(px + w/2, py + 4); ctx.lineTo(px + w/2, py - 22);
-    ctx.stroke();
-    // Pole finial (gold ball)
-    ctx.fillStyle = '#d4a040';
-    ctx.beginPath();
-    ctx.arc(px + w/2, py - 22, 2, 0, Math.PI * 2);
-    ctx.fill();
-    // Pennant cloth
-    ctx.fillStyle = player.color;
-    ctx.beginPath();
-    ctx.moveTo(px + w/2, py - 20);
-    ctx.lineTo(px + w/2 + 14, py - 16);
-    ctx.lineTo(px + w/2 + 12, py - 12);
-    ctx.lineTo(px + w/2, py - 8);
-    ctx.closePath();
-    ctx.fill();
-    // Pennant bright stripe along the top edge
-    ctx.fillStyle = player.colorBright;
-    ctx.beginPath();
-    ctx.moveTo(px + w/2, py - 20);
-    ctx.lineTo(px + w/2 + 14, py - 16);
-    ctx.lineTo(px + w/2 + 12, py - 15);
-    ctx.lineTo(px + w/2, py - 18);
-    ctx.closePath();
-    ctx.fill();
-    ctx.strokeStyle = '#1a1410';
-    ctx.lineWidth = 0.8;
-    ctx.beginPath();
-    ctx.moveTo(px + w/2, py - 20);
-    ctx.lineTo(px + w/2 + 14, py - 16);
-    ctx.lineTo(px + w/2 + 12, py - 12);
-    ctx.lineTo(px + w/2, py - 8);
-    ctx.closePath();
-    ctx.stroke();
-
-    // Small flags on the corner crenellations — left and right
-    const drawCornerFlag = (cx, cy) => {
-      ctx.strokeStyle = '#3a2a1a';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(cx, cy); ctx.lineTo(cx, cy - 10);
-      ctx.stroke();
-      ctx.fillStyle = player.colorBright;
-      ctx.beginPath();
-      ctx.moveTo(cx, cy - 10);
-      ctx.lineTo(cx + 6, cy - 8);
-      ctx.lineTo(cx, cy - 6);
-      ctx.closePath();
-      ctx.fill();
-    };
-    drawCornerFlag(px + 6, py - 2);
-    drawCornerFlag(px + w - 6, py - 2);
-
-    // Decorative arrow slits
-    ctx.fillStyle = '#1a1410';
-    for (let i = 0; i < 3; i++) {
-      ctx.fillRect(px + 8 + i * (w - 16) / 2, py + 12, 2, 5);
+      ctx.moveTo(cxc - 7, baseY - 6); ctx.lineTo(cxc - 7, baseY - 18);
+      ctx.quadraticCurveTo(cxc, baseY - 25, cxc + 7, baseY - 18);
+      ctx.lineTo(cxc + 7, baseY - 6); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#5a3e22'; ctx.fillRect(cxc - 5, baseY - 16, 10, 10);
+      ctx.strokeStyle = '#1a1208'; ctx.lineWidth = 0.8;
+      for (let i = 0; i < 3; i++) { ctx.beginPath(); ctx.moveTo(cxc - 5, baseY - 13 + i * 3); ctx.lineTo(cxc + 5, baseY - 13 + i * 3); ctx.stroke(); }
+      // Two front corner round towers
+      let lt = prim_round_tower(px + 14, baseY + 2, 9, 34, sCol);
+      prim_crenels(px + 5, lt + 3, 18, 5, sCol);
+      prim_cone(px + 14, lt - 2, 10, 12, '#7a3f2c', '#9c5a3c');
+      let rt = prim_round_tower(px + w - 14, baseY + 2, 9, 34, sCol);
+      prim_crenels(px + w - 23, rt + 3, 18, 5, sCol);
+      prim_cone(px + w - 14, rt - 2, 10, 12, '#7a3f2c', '#9c5a3c');
+      // Central tall keep (behind, between towers)
+      const kw = 30, kx = cxc - kw / 2;
+      let kt = prim_box(kx, baseY - 4, kw, 46, '#c0ac86', {});
+      prim_crenels(kx, kt, kw, 7, '#c0ac86');
+      // keep windows
+      ctx.fillStyle = '#1a1208';
+      for (let r = 0; r < 2; r++) for (let c = 0; c < 2; c++) ctx.fillRect(kx + 7 + c * 12, kt + 8 + r * 12, 3, 6);
+      // arrow slits on towers
+      ctx.fillStyle = '#1a1208';
+      ctx.fillRect(px + 13, lt + 8, 2, 6);
+      ctx.fillRect(px + w - 15, rt + 8, 2, 6);
+      e._topY = kt - 7;
+      // Cone-top pennants + keep banner
+      drawTeamPennant(ctx, player, px + 14, lt - 12, 12, 8);
+      drawTeamPennant(ctx, player, px + w - 14, rt - 12, 12, 8);
+      // Hanging banner on the keep
+      ctx.fillStyle = player.color; ctx.fillRect(cxc - 4, kt + 6, 8, 20);
+      ctx.fillStyle = player.colorBright; ctx.fillRect(cxc - 4, kt + 6, 8, 2.5);
+      ctx.fillStyle = '#c0ac86';
+      ctx.beginPath(); ctx.moveTo(cxc - 4, kt + 26); ctx.lineTo(cxc, kt + 22); ctx.lineTo(cxc + 4, kt + 26); ctx.closePath(); ctx.fill();
+    } else {
+      // ---- INDUSTRIAL / MODERN — brick town skyline ----
+      const brick = '#9c6a52', brickHi = '#b07a5c';
+      // Row of buildings of varying heights forming a skyline
+      const segs = [
+        { x: px + 4, w: 20, hgt: 26, col: '#8a6a55' },
+        { x: px + 26, w: 18, hgt: 40, col: brick },
+        { x: px + 62, w: 16, hgt: 30, col: '#7c8a92' },
+        { x: px + w - 22, w: 18, hgt: 22, col: '#8a6a55' },
+      ];
+      let hi = baseY;
+      for (const s of segs) {
+        let t = prim_box(s.x, baseY, s.w, s.hgt, s.col, {});
+        // flat parapet
+        ctx.fillStyle = _shade(s.col, 0.7); ctx.fillRect(s.x, t, s.w, 2);
+        // lit window rows
+        for (let r = 0; r < (s.hgt / 9) | 0; r++) {
+          for (let c = 0; c < (s.w / 7) | 0; c++) {
+            const lit = ((s.x + r * 13 + c * 7) % 5) < 3;
+            ctx.fillStyle = lit ? 'rgba(255,224,150,0.9)' : 'rgba(30,40,55,0.85)';
+            ctx.fillRect(s.x + 3 + c * 7, t + 5 + r * 9, 3, 4);
+          }
+        }
+        hi = Math.min(hi, t);
+      }
+      // Central clock/bell tower (tallest)
+      const tw = 18, tx = cxc - tw / 2;
+      let tt = prim_box(tx, baseY - 2, tw, 54, '#b0a488', {});
+      // clock face
+      ctx.fillStyle = '#f4ecd0'; ctx.beginPath(); ctx.arc(cxc, tt + 9, 4.5, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = '#2a2418'; ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(cxc, tt + 9, 4.5, 0, Math.PI * 2); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(cxc, tt + 9); ctx.lineTo(cxc, tt + 6); ctx.moveTo(cxc, tt + 9); ctx.lineTo(cxc + 2.5, tt + 9); ctx.stroke();
+      // tower roof (pyramid)
+      prim_gable(tx - 2, tt, tw + 4, 12, '#5a4a38', '#7a6450');
+      // Smokestack with animated smoke
+      const smX = px + w - 12;
+      ctx.fillStyle = '#5a4a40'; ctx.fillRect(smX, baseY - 38, 6, 38);
+      ctx.fillStyle = '#3a2e28'; ctx.fillRect(smX, baseY - 38, 6, 3);
+      for (let i = 0; i < 3; i++) {
+        const sp = (State.time * 0.5 + i * 0.33 + e.id * 0.1) % 1;
+        ctx.fillStyle = `rgba(180,175,170,${0.5 * (1 - sp)})`;
+        ctx.beginPath(); ctx.arc(smX + 3 + sp * 4, baseY - 38 - sp * 14, 2.5 + sp * 3, 0, Math.PI * 2); ctx.fill();
+      }
+      e._topY = tt - 12;
+      drawTeamPennant(ctx, player, cxc, tt - 11, 13, 9);
     }
   } else if (e.subtype === 'house') {
-    const wallCol = '#d4c498';
-    // South depth band
-    ctx.fillStyle = '#8a7558';
-    ctx.fillRect(px + 3, py + h - depth, w - 6, depth);
-    // Body
-    ctx.fillStyle = wallCol;
-    ctx.fillRect(px + 3, py + h/2, w - 6, h/2 - depth);
-    // Roof: pitched, dark red tiles
+    // Cozy cottage: taller body, steep gable roof, dormer + chimney smoke.
+    const baseY = py + h - 2;
+    const bodyW = w - 10, bodyX = px + 5;
+    let bt = prim_box(bodyX, baseY, bodyW, Math.round(h * 0.42), '#d8c89c', { lit: 0.16, shade: 0.2 });
+    // exposed timber framing (Tudor-style cross beams)
+    ctx.strokeStyle = 'rgba(90,62,38,0.55)';
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.moveTo(bodyX + 2, bt + 2); ctx.lineTo(bodyX + bodyW - 2, baseY - 2);
+    ctx.moveTo(bodyX + bodyW - 2, bt + 2); ctx.lineTo(bodyX + 2, baseY - 2);
+    ctx.stroke();
+    // steep pitched roof rising well above the body
+    const ridgeRise = Math.round(h * 0.4);
     ctx.fillStyle = '#7a3a28';
     ctx.beginPath();
-    ctx.moveTo(px + 3, py + h/2 + 2);
-    ctx.lineTo(px + w/2, py + 3);
-    ctx.lineTo(px + w - 3, py + h/2 + 2);
-    ctx.closePath();
-    ctx.fill();
-    // Roof highlight ridge
-    ctx.fillStyle = '#9a4a38';
+    ctx.moveTo(bodyX - 4, bt + 2);
+    ctx.lineTo(px + w / 2, bt - ridgeRise);
+    ctx.lineTo(bodyX + bodyW + 4, bt + 2);
+    ctx.closePath(); ctx.fill();
+    // sunlit left slope
+    ctx.fillStyle = '#9c4c36';
     ctx.beginPath();
-    ctx.moveTo(px + 3, py + h/2 + 2);
-    ctx.lineTo(px + w/2, py + 3);
-    ctx.lineTo(px + w/2 - 2, py + 5);
-    ctx.lineTo(px + 6, py + h/2 + 2);
-    ctx.closePath();
-    ctx.fill();
-    // Roof tile lines
-    ctx.strokeStyle = 'rgba(40,20,15,0.4)';
-    ctx.lineWidth = 1;
-    for (let i = 1; i < 4; i++) {
-      ctx.beginPath();
-      ctx.moveTo(px + 3 + i * 3, py + h/2 + 2 - i * (h/2 - 4)/4);
-      ctx.lineTo(px + w - 3 - i * 3, py + h/2 + 2 - i * (h/2 - 4)/4);
-      ctx.stroke();
-    }
-    // Door
-    ctx.fillStyle = '#3a2818';
-    ctx.fillRect(px + w/2 - 3, py + h - depth - 9, 6, 9);
-    ctx.fillStyle = '#e6c068';
-    ctx.fillRect(px + w/2 + 1.5, py + h - depth - 5, 0.8, 1.5);
-    // Windows with team-color shutters
-    ctx.fillStyle = player.color;
-    ctx.fillRect(px + 6, py + h - depth - 8, 5, 5);
-    ctx.fillRect(px + w - 11, py + h - depth - 8, 5, 5);
-    ctx.fillStyle = '#f4e8b0';
-    ctx.fillRect(px + 7, py + h - depth - 7, 3, 3);
-    ctx.fillRect(px + w - 10, py + h - depth - 7, 3, 3);
-    // Chimney with smoke
-    ctx.fillStyle = '#5a4030';
-    ctx.fillRect(px + w - 12, py + 5, 4, 8);
-    // Drifting smoke (slow drift)
+    ctx.moveTo(bodyX - 4, bt + 2);
+    ctx.lineTo(px + w / 2, bt - ridgeRise);
+    ctx.lineTo(px + w / 2 - 3, bt - ridgeRise + 4);
+    ctx.lineTo(bodyX + 2, bt + 2);
+    ctx.closePath(); ctx.fill();
+    // roof shingle lines
+    ctx.strokeStyle = 'rgba(40,20,15,0.4)'; ctx.lineWidth = 1;
+    for (let i = 1; i < 4; i++) { const yy = bt - ridgeRise + i * ridgeRise / 4; const xspan = (bodyW + 8) * (i / 4) / 2; ctx.beginPath(); ctx.moveTo(px + w / 2 - xspan, yy); ctx.lineTo(px + w / 2 + xspan, yy); ctx.stroke(); }
+    // door
+    ctx.fillStyle = '#3a2818'; ctx.fillRect(px + w / 2 - 3, baseY - 9, 6, 9);
+    ctx.fillStyle = '#e6c068'; ctx.fillRect(px + w / 2 + 1.5, baseY - 5, 0.8, 1.5);
+    // windows w/ team-color shutters + warm glow
+    ctx.fillStyle = player.color; ctx.fillRect(bodyX + 2, baseY - 11, 5, 5); ctx.fillRect(bodyX + bodyW - 7, baseY - 11, 5, 5);
+    ctx.fillStyle = '#ffdf94'; ctx.fillRect(bodyX + 3, baseY - 10, 3, 3); ctx.fillRect(bodyX + bodyW - 6, baseY - 10, 3, 3);
+    // chimney + smoke
+    ctx.fillStyle = '#6a4a32'; ctx.fillRect(px + w - 16, bt - ridgeRise + 4, 4, 9);
+    ctx.fillStyle = '#4a3424'; ctx.fillRect(px + w - 16, bt - ridgeRise + 4, 4, 2);
     const sm = (State.time * 0.5 + e.id * 0.3) % 1;
-    ctx.fillStyle = `rgba(220,215,210,${0.6 * (1 - sm)})`;
-    ctx.beginPath();
-    ctx.arc(px + w - 10, py + 2 - sm * 8, 2 + sm * 2, 0, Math.PI*2);
-    ctx.fill();
-    // Tiny rooftop pennant — visible team identification at distance.
-    ctx.strokeStyle = '#3a2a1a';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(px + 7, py + 3); ctx.lineTo(px + 7, py - 5);
-    ctx.stroke();
-    ctx.fillStyle = player.colorBright;
-    ctx.beginPath();
-    ctx.moveTo(px + 7, py - 5);
-    ctx.lineTo(px + 12, py - 3);
-    ctx.lineTo(px + 7, py - 1);
-    ctx.closePath();
-    ctx.fill();
+    ctx.fillStyle = `rgba(220,215,210,${0.55 * (1 - sm)})`;
+    ctx.beginPath(); ctx.arc(px + w - 14, bt - ridgeRise + 2 - sm * 8, 2 + sm * 2, 0, Math.PI * 2); ctx.fill();
+    e._topY = bt - ridgeRise;
+    // rooftop pennant
+    drawTeamPennant(ctx, player, px + w / 2, bt - ridgeRise + 1, 9, 6);
   } else if (e.subtype === 'farm') {
-    // Farms are walkable fields — render almost flat with depth-free look
-    // Border fence
+    // Tilled field with rows of little plants budding out of the soil. Stays
+    // low/walkable but gains 3D crops with highlights and gentle sway.
+    // Soil bed
+    ctx.fillStyle = '#6e4a28';
+    ctx.fillRect(px + 3, py + 3, w - 6, h - 6);
+    // Tilled furrow ridges (lit tops, shadowed troughs) for depth
+    const rows = 5;
+    for (let r = 0; r < rows; r++) {
+      const ry = py + 5 + r * (h - 10) / rows;
+      ctx.fillStyle = '#8a6536';
+      ctx.fillRect(px + 5, ry, w - 10, 2.5);
+      ctx.fillStyle = 'rgba(40,26,14,0.4)';
+      ctx.fillRect(px + 5, ry + 2.5, w - 10, 1.5);
+    }
+    // Low fence posts at corners
     ctx.fillStyle = '#5a3a22';
-    ctx.fillRect(px + 2, py + 2, w - 4, 2);
-    ctx.fillRect(px + 2, py + h - 4, w - 4, 2);
-    ctx.fillRect(px + 2, py + 2, 2, h - 4);
-    ctx.fillRect(px + w - 4, py + 2, 2, h - 4);
-    // Tilled rows
-    ctx.fillStyle = '#8a6534';
-    ctx.fillRect(px + 4, py + 4, w - 8, h - 8);
-    ctx.fillStyle = '#a87a3a';
-    for (let r = 0; r < 5; r++) {
-      ctx.fillRect(px + 5, py + 5 + r * (h - 10) / 5, w - 10, 2);
+    for (const [fx, fy] of [[px + 3, py + 3], [px + w - 5, py + 3], [px + 3, py + h - 6], [px + w - 5, py + h - 6]]) {
+      ctx.fillRect(fx, fy - 2, 2, 5);
     }
-    // Wheat tufts
-    ctx.fillStyle = '#e6c068';
-    for (let r = 0; r < 4; r++) {
-      for (let c = 0; c < 5; c++) {
-        const wx = px + 7 + c * (w - 14) / 4;
-        const wy = py + 7 + r * (h - 14) / 3;
-        ctx.fillRect(wx, wy, 1.5, 3);
+    // Budding plants — small sprouts on the ridges, height varies by growth.
+    // Use a stable per-cell phase so each plant sways slightly out of sync.
+    const cols = 5;
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const baseX = px + 8 + c * (w - 16) / (cols - 1);
+        const baseY = py + 6 + r * (h - 12) / (rows - 1) + 3;
+        const seed = (r * 7 + c * 13 + e.id) % 5;
+        const grow = 3 + seed; // plant height
+        const sway = Math.sin(State.time * 1.6 + r * 0.7 + c * 1.1) * 0.8;
+        // stem
+        ctx.strokeStyle = '#4e7a34';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(baseX, baseY);
+        ctx.quadraticCurveTo(baseX + sway * 0.5, baseY - grow * 0.6, baseX + sway, baseY - grow);
+        ctx.stroke();
+        // leaves (two small blades)
+        ctx.strokeStyle = '#5e9440';
+        ctx.beginPath();
+        ctx.moveTo(baseX, baseY - grow * 0.5);
+        ctx.lineTo(baseX - 2 + sway * 0.5, baseY - grow * 0.5 - 1.5);
+        ctx.moveTo(baseX, baseY - grow * 0.5);
+        ctx.lineTo(baseX + 2 + sway * 0.5, baseY - grow * 0.5 - 1.5);
+        ctx.stroke();
+        // bud / fruit on top — green for young, golden when mature (seed>=3)
+        ctx.fillStyle = seed >= 3 ? '#e8c45a' : '#7ab048';
+        ctx.beginPath();
+        ctx.arc(baseX + sway, baseY - grow, seed >= 3 ? 1.8 : 1.2, 0, Math.PI * 2);
+        ctx.fill();
+        // tiny highlight
+        ctx.fillStyle = 'rgba(255,255,230,0.6)';
+        ctx.beginPath();
+        ctx.arc(baseX + sway - 0.4, baseY - grow - 0.4, 0.6, 0, Math.PI * 2);
+        ctx.fill();
       }
     }
-    ctx.fillStyle = '#f0d090';
-    for (let r = 0; r < 4; r++) {
-      for (let c = 0; c < 5; c++) {
-        const wx = px + 7 + c * (w - 14) / 4;
-        const wy = py + 7 + r * (h - 14) / 3;
-        ctx.fillRect(wx + 0.4, wy, 0.6, 1.5);
-      }
-    }
+    e._topY = py;
     // Team-color marker pennant at the NE fence corner
     drawTeamPennant(ctx, player, px + w - 4, py + 4, 9, 5);
   } else if (e.subtype === 'lumber') {
-    // Wooden building
-    ctx.fillStyle = '#5a3a20';
-    ctx.fillRect(px + 3, py + h - depth, w - 6, depth);
-    ctx.fillStyle = '#8a5a30';
-    ctx.fillRect(px + 3, py + 6, w - 6, h - 6 - depth);
-    // Wooden plank lines
-    ctx.strokeStyle = '#5a3818';
+    // Asymmetric log cabin with a lean-to wood store and offset chimney.
+    const baseY = py + h - 2;
+    // --- Main cabin (left, taller) ---
+    const cabW = Math.round(w * 0.58), cabX = px + 3;
+    let ct = prim_box(cabX, baseY, cabW, 20, '#8a5e34', { lit: 0.12, shade: 0.24 });
+    // log courses (horizontal rounded logs)
+    ctx.strokeStyle = 'rgba(58,36,18,0.6)';
     ctx.lineWidth = 1;
-    for (let i = 1; i < 4; i++) {
-      ctx.beginPath();
-      ctx.moveTo(px + 3, py + 6 + i * (h - 6 - depth) / 4);
-      ctx.lineTo(px + w - 3, py + 6 + i * (h - 6 - depth) / 4);
-      ctx.stroke();
-    }
-    // Pitched plank roof
+    for (let i = 1; i < 4; i++) { const yy = ct + i * 20 / 4; ctx.beginPath(); ctx.moveTo(cabX, yy); ctx.lineTo(cabX + cabW, yy); ctx.stroke(); }
+    // log-end circles on the left gable wall
+    ctx.fillStyle = '#9c6a3c';
+    for (let i = 0; i < 4; i++) { ctx.beginPath(); ctx.arc(cabX + 1.5, ct + 3 + i * 5, 1.6, 0, Math.PI * 2); ctx.fill(); }
+    // steep asymmetric gable roof, ridge offset toward the left
+    const ridgeX = cabX + cabW * 0.4;
+    ctx.fillStyle = '#4a3320';
+    ctx.beginPath();
+    ctx.moveTo(cabX - 3, ct + 2);
+    ctx.lineTo(ridgeX, ct - 15);
+    ctx.lineTo(cabX + cabW + 3, ct + 2);
+    ctx.closePath(); ctx.fill();
+    // sunlit left slope
+    ctx.fillStyle = '#6a4a2c';
+    ctx.beginPath();
+    ctx.moveTo(cabX - 3, ct + 2); ctx.lineTo(ridgeX, ct - 15); ctx.lineTo(ridgeX - 2, ct - 12); ctx.lineTo(cabX + 2, ct + 2);
+    ctx.closePath(); ctx.fill();
+    // plank texture on roof
+    ctx.strokeStyle = 'rgba(30,18,10,0.4)'; ctx.lineWidth = 0.8;
+    for (let i = 1; i < 3; i++) { const yy = ct - 15 + i * 17 / 3; ctx.beginPath(); ctx.moveTo(ridgeX - i * 5, yy); ctx.lineTo(cabX + cabW + 2 - i * 4, yy); ctx.stroke(); }
+    // door
+    ctx.fillStyle = '#2a1a0e'; ctx.fillRect(cabX + cabW * 0.4, baseY - 11, 7, 11);
+    // small window with warm glow
+    ctx.fillStyle = '#ffcf78'; ctx.fillRect(cabX + 4, ct + 6, 4, 4);
+    ctx.strokeStyle = '#3a2410'; ctx.lineWidth = 0.8; ctx.strokeRect(cabX + 4, ct + 6, 4, 4);
+    // stone chimney with smoke (offset right of ridge)
+    ctx.fillStyle = '#6a5a4a'; ctx.fillRect(ridgeX + 7, ct - 10, 4, 12);
+    ctx.fillStyle = '#4a3e32'; ctx.fillRect(ridgeX + 7, ct - 10, 4, 2);
+    const sm = (State.time * 0.5 + e.id * 0.3) % 1;
+    ctx.fillStyle = `rgba(210,205,200,${0.5 * (1 - sm)})`;
+    ctx.beginPath(); ctx.arc(ridgeX + 9, ct - 12 - sm * 8, 2 + sm * 2, 0, Math.PI * 2); ctx.fill();
+    // --- Lean-to wood store (right, shorter) ---
+    const leanX = cabX + cabW + 1, leanW = px + w - 2 - leanX;
+    let lt2 = prim_box(leanX, baseY, leanW, 11, '#6a4628', { lit: 0.1, shade: 0.26 });
+    // slanted lean-to roof
     ctx.fillStyle = '#3a2818';
     ctx.beginPath();
-    ctx.moveTo(px + 1, py + 8); ctx.lineTo(px + w/2, py + 1); ctx.lineTo(px + w - 1, py + 8);
-    ctx.lineTo(px + w - 3, py + 9); ctx.lineTo(px + w/2, py + 4); ctx.lineTo(px + 3, py + 9);
+    ctx.moveTo(leanX - 1, lt2 + 1); ctx.lineTo(leanX + leanW + 1, lt2 - 6); ctx.lineTo(leanX + leanW + 1, lt2 + 1);
     ctx.closePath(); ctx.fill();
-    // Stacked logs at the side
-    ctx.fillStyle = '#3a2010';
-    ctx.fillRect(px + 4, py + h - depth - 6, w - 8, 5);
-    ctx.fillStyle = '#5a3818';
-    for (let i = 0; i < 3; i++) {
-      ctx.beginPath();
-      ctx.arc(px + 6 + i * 7, py + h - depth - 4, 1.5, 0, Math.PI*2);
-      ctx.fill();
+    // stacked logs under the lean-to (end-on)
+    ctx.fillStyle = '#7a5230';
+    for (let r = 0; r < 2; r++) for (let c = 0; c < 3; c++) {
+      ctx.beginPath(); ctx.arc(leanX + 3 + c * 4, baseY - 2 - r * 3.5, 1.8, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#5a3a1e'; ctx.beginPath(); ctx.arc(leanX + 3 + c * 4, baseY - 2 - r * 3.5, 0.8, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#7a5230';
     }
-    // Axe in stump
-    ctx.strokeStyle = '#3a2a1a';
-    ctx.lineWidth = 1.5;
+    // chopping stump with axe out front
+    ctx.fillStyle = '#5a3a1e'; ctx.beginPath(); ctx.ellipse(px + 6, baseY - 1, 3, 1.6, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#3a2a1a'; ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(px + 6, baseY - 2); ctx.lineTo(px + 10, baseY - 9); ctx.stroke();
+    ctx.fillStyle = '#c8c8c8';
+    ctx.beginPath(); ctx.moveTo(px + 9, baseY - 9); ctx.lineTo(px + 12, baseY - 11); ctx.lineTo(px + 12, baseY - 8); ctx.closePath(); ctx.fill();
+    e._topY = ct - 15;
+    drawTeamPennant(ctx, player, ridgeX, ct - 14, 11, 7);
+  } else if (e.subtype === 'mine') {
+    // Rounded rocky mound with a mine-shaft entrance — no longer a box.
+    const baseY = py + h - 2;
+    const cxc = px + w / 2;
+    const moundW = w - 6, moundH = h - 8;
+    // Mound body: a domed rock pile built from stacked ellipses
+    ctx.fillStyle = '#5a4c3a';
     ctx.beginPath();
-    ctx.moveTo(px + w - 8, py + 12); ctx.lineTo(px + w - 12, py + 18);
-    ctx.stroke();
-    ctx.fillStyle = '#c0c0c0';
-    ctx.beginPath();
-    ctx.moveTo(px + w - 9, py + 11);
-    ctx.lineTo(px + w - 6, py + 9);
-    ctx.lineTo(px + w - 5, py + 13);
+    ctx.ellipse(cxc, baseY - moundH * 0.18, moundW / 2, moundH * 0.5, 0, Math.PI, 0);
+    ctx.lineTo(cxc + moundW / 2, baseY);
+    ctx.lineTo(cxc - moundW / 2, baseY);
     ctx.closePath();
     ctx.fill();
-    // Team pennant on the front-right roof corner
-    drawTeamPennant(ctx, player, px + w - 5, py + 5, 9, 5);
-  } else if (e.subtype === 'mine') {
-    // Rocky base
-    ctx.fillStyle = '#4a3e30';
-    ctx.fillRect(px + 3, py + h - depth, w - 6, depth);
+    // Rounded sunlit top dome
+    ctx.fillStyle = '#7a6a52';
+    ctx.beginPath();
+    ctx.ellipse(cxc, baseY - moundH * 0.5, moundW / 2 - 3, moundH * 0.42, 0, Math.PI, 0);
+    ctx.fill();
+    // NW light highlight on the dome
+    ctx.fillStyle = 'rgba(255,245,220,0.22)';
+    ctx.beginPath();
+    ctx.ellipse(cxc - moundW * 0.16, baseY - moundH * 0.62, moundW * 0.22, moundH * 0.2, -0.5, 0, Math.PI * 2);
+    ctx.fill();
+    // Right-side shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.18)';
+    ctx.beginPath();
+    ctx.ellipse(cxc + moundW * 0.22, baseY - moundH * 0.3, moundW * 0.18, moundH * 0.32, 0.4, 0, Math.PI * 2);
+    ctx.fill();
+    // Scattered boulders around the base for a craggy silhouette
     ctx.fillStyle = '#6a5a44';
-    ctx.fillRect(px + 3, py + 6, w - 6, h - 6 - depth);
-    // Rugged stone top edge
-    ctx.fillStyle = '#5a4a36';
-    for (let i = 0; i < 6; i++) {
-      const cx = px + 4 + i * (w - 8) / 5;
-      ctx.fillRect(cx, py + 4, 4, 5);
+    for (const [bx, by, br] of [[px + 4, baseY - 3, 5], [px + w - 6, baseY - 4, 6], [cxc - 16, baseY - 2, 4]]) {
+      ctx.beginPath(); ctx.arc(bx, by, br, Math.PI, 0); ctx.fill();
     }
-    // Mine entrance (dark arch)
+    // Mine-shaft entrance (dark arched timber frame)
     ctx.fillStyle = '#0a0805';
     ctx.beginPath();
-    ctx.moveTo(px + w/2 - 7, py + h - depth - 1);
-    ctx.lineTo(px + w/2 - 7, py + 14);
-    ctx.quadraticCurveTo(px + w/2, py + 6, px + w/2 + 7, py + 14);
-    ctx.lineTo(px + w/2 + 7, py + h - depth - 1);
+    ctx.moveTo(cxc - 8, baseY);
+    ctx.lineTo(cxc - 8, baseY - 13);
+    ctx.quadraticCurveTo(cxc, baseY - 20, cxc + 8, baseY - 13);
+    ctx.lineTo(cxc + 8, baseY);
     ctx.closePath();
     ctx.fill();
-    // Wooden support beams
-    ctx.fillStyle = '#5a3a20';
-    ctx.fillRect(px + w/2 - 8, py + 14, 2, h - 14 - depth);
-    ctx.fillRect(px + w/2 + 6, py + 14, 2, h - 14 - depth);
-    // Carts or gold piles near the entrance
-    ctx.fillStyle = '#c89b3c';
+    // Timber frame around the entrance
+    ctx.strokeStyle = '#4a3018';
+    ctx.lineWidth = 2.5;
     ctx.beginPath();
-    ctx.arc(px + 8, py + h - depth - 4, 3, 0, Math.PI*2);
-    ctx.arc(px + w - 8, py + h - depth - 4, 3, 0, Math.PI*2);
-    ctx.fill();
-    ctx.fillStyle = '#ffd860';
-    ctx.beginPath();
-    ctx.arc(px + 8, py + h - depth - 4, 1, 0, Math.PI*2);
-    ctx.arc(px + w - 8, py + h - depth - 4, 1, 0, Math.PI*2);
-    ctx.fill();
-    // Pickaxe leaning
-    ctx.strokeStyle = '#3a2a1a';
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.moveTo(px + 6, py + h - depth - 2); ctx.lineTo(px + 12, py + 8);
+    ctx.moveTo(cxc - 9, baseY);
+    ctx.lineTo(cxc - 9, baseY - 13);
+    ctx.quadraticCurveTo(cxc, baseY - 21, cxc + 9, baseY - 13);
+    ctx.lineTo(cxc + 9, baseY);
     ctx.stroke();
-    ctx.strokeStyle = '#999';
-    ctx.beginPath();
-    ctx.moveTo(px + 9, py + 10); ctx.lineTo(px + 14, py + 7);
-    ctx.stroke();
-    // Team pennant on a stake at the front
-    drawTeamPennant(ctx, player, px + w - 5, py + 6, 9, 5);
-  } else if (e.subtype === 'barracks') {
-    // Stone walls with player color accents
-    ctx.fillStyle = '#5a4838';
-    ctx.fillRect(px + 2, py + h - depth, w - 4, depth);
-    ctx.fillStyle = '#8a7558';
-    ctx.fillRect(px + 2, py + 8, w - 4, h - 8 - depth);
-    // Player-color banner strip across the top
-    ctx.fillStyle = player.color;
-    ctx.fillRect(px + 2, py + 6, w - 4, 4);
-    // Heavy roof
-    ctx.fillStyle = '#3a2818';
-    ctx.fillRect(px + 1, py + 4, w - 2, 5);
-    // Double doors
-    ctx.fillStyle = '#1a1410';
-    ctx.fillRect(px + w/2 - 6, py + h - depth - 13, 12, 13);
-    ctx.fillStyle = '#3a2818';
-    ctx.fillRect(px + w/2 - 5, py + h - depth - 12, 10, 12);
-    ctx.strokeStyle = '#1a1410';
+    // Minecart rail leading out
+    ctx.strokeStyle = '#3a2e22';
     ctx.lineWidth = 1;
     ctx.beginPath();
-    ctx.moveTo(px + w/2, py + h - depth - 12); ctx.lineTo(px + w/2, py + h - depth - 0.5);
+    ctx.moveTo(cxc - 3, baseY); ctx.lineTo(cxc - 3, baseY - 8);
+    ctx.moveTo(cxc + 3, baseY); ctx.lineTo(cxc + 3, baseY - 8);
     ctx.stroke();
-    // Weapon rack stripe — crossed weapons over door
-    ctx.strokeStyle = '#cccccc';
-    ctx.lineWidth = 1.5;
+    // Ore/gold glints on the mound
+    ctx.fillStyle = e.workResource === 'ore' ? '#8a8a98' : '#d4a83c';
+    for (const [gx, gy] of [[cxc - 12, baseY - 16], [cxc + 13, baseY - 14], [cxc - 6, baseY - 22]]) {
+      ctx.beginPath(); ctx.arc(gx, gy, 1.6, 0, Math.PI * 2); ctx.fill();
+    }
+    e._topY = baseY - moundH;
+    // Team pennant atop the mound
+    drawTeamPennant(ctx, player, cxc + moundW * 0.28, baseY - moundH * 0.55, 11, 7);
+  } else if (e.subtype === 'barracks') {
+    // Fortified drill hall: stone body, peaked timber roof, banners flanking a
+    // reinforced double door, shield over the lintel.
+    const baseY = py + h - 2;
+    const bodyW = w - 8, bodyX = px + 4;
+    let bt = prim_box(bodyX, baseY, bodyW, Math.round(h * 0.5), '#8a7558', { lit: 0.14, shade: 0.22 });
+    // stone block lines
+    ctx.strokeStyle = 'rgba(40,28,18,0.4)'; ctx.lineWidth = 0.8;
+    for (let r = 1; r < 3; r++) { const yy = bt + r * (h * 0.5) / 3; ctx.beginPath(); ctx.moveTo(bodyX, yy); ctx.lineTo(bodyX + bodyW, yy); ctx.stroke(); }
+    // peaked timber roof
+    const rise = Math.round(h * 0.34);
+    ctx.fillStyle = '#4a3320';
     ctx.beginPath();
-    ctx.moveTo(px + w/2 - 10, py + 12); ctx.lineTo(px + w/2 + 10, py + 16);
-    ctx.moveTo(px + w/2 + 10, py + 12); ctx.lineTo(px + w/2 - 10, py + 16);
-    ctx.stroke();
-    // Side windows
-    ctx.fillStyle = '#1a1410';
-    ctx.fillRect(px + 5, py + 14, 4, 6);
-    ctx.fillRect(px + w - 9, py + 14, 4, 6);
-    ctx.fillStyle = '#d4a040';
-    ctx.fillRect(px + 5, py + 14, 4, 1);
-    ctx.fillRect(px + w - 9, py + 14, 4, 1);
-    // Tall pennant pole — major team identifier
-    ctx.strokeStyle = '#3a2a1a';
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.moveTo(px + w - 6, py + 6); ctx.lineTo(px + w - 6, py - 14);
-    ctx.stroke();
+    ctx.moveTo(bodyX - 4, bt + 2); ctx.lineTo(px + w / 2, bt - rise); ctx.lineTo(bodyX + bodyW + 4, bt + 2); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#6a4a2c';
+    ctx.beginPath(); ctx.moveTo(bodyX - 4, bt + 2); ctx.lineTo(px + w / 2, bt - rise); ctx.lineTo(px + w / 2 - 3, bt - rise + 4); ctx.lineTo(bodyX + 2, bt + 2); ctx.closePath(); ctx.fill();
+    // team-color roof banner ridge
+    ctx.fillStyle = player.color; ctx.fillRect(px + w / 2 - 2, bt - rise, 4, rise * 0.5);
+    // reinforced double doors
+    ctx.fillStyle = '#1a1208'; ctx.fillRect(px + w / 2 - 6, baseY - 13, 12, 13);
+    ctx.fillStyle = '#3a2818'; ctx.fillRect(px + w / 2 - 5, baseY - 12, 10, 12);
+    ctx.strokeStyle = '#1a1208'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(px + w / 2, baseY - 12); ctx.lineTo(px + w / 2, baseY - 0.5); ctx.stroke();
+    // iron studs
+    ctx.fillStyle = '#5a5a5a';
+    for (let r = 0; r < 3; r++) { ctx.beginPath(); ctx.arc(px + w / 2 - 3, baseY - 10 + r * 4, 0.8, 0, Math.PI * 2); ctx.arc(px + w / 2 + 3, baseY - 10 + r * 4, 0.8, 0, Math.PI * 2); ctx.fill(); }
+    // shield emblem over the door
     ctx.fillStyle = player.colorBright;
     ctx.beginPath();
-    ctx.moveTo(px + w - 6, py - 14);
-    ctx.lineTo(px + w + 4, py - 11);
-    ctx.lineTo(px + w + 2, py - 8);
-    ctx.lineTo(px + w - 6, py - 5);
-    ctx.closePath();
-    ctx.fill();
-    ctx.strokeStyle = player.color;
-    ctx.lineWidth = 0.8;
-    ctx.stroke();
+    ctx.moveTo(px + w / 2 - 4, bt + 4); ctx.lineTo(px + w / 2 + 4, bt + 4); ctx.lineTo(px + w / 2 + 4, bt + 9); ctx.lineTo(px + w / 2, bt + 12); ctx.lineTo(px + w / 2 - 4, bt + 9); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = '#1a1208'; ctx.lineWidth = 0.8; ctx.stroke();
+    // crossed swords on the shield
+    ctx.strokeStyle = '#dcdcdc'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(px + w / 2 - 2.5, bt + 5.5); ctx.lineTo(px + w / 2 + 2.5, bt + 9.5); ctx.moveTo(px + w / 2 + 2.5, bt + 5.5); ctx.lineTo(px + w / 2 - 2.5, bt + 9.5); ctx.stroke();
+    // side windows w/ warm glow
+    ctx.fillStyle = '#1a1208'; ctx.fillRect(bodyX + 2, baseY - 11, 4, 6); ctx.fillRect(bodyX + bodyW - 6, baseY - 11, 4, 6);
+    ctx.fillStyle = '#d4a040'; ctx.fillRect(bodyX + 2, baseY - 11, 4, 1.2); ctx.fillRect(bodyX + bodyW - 6, baseY - 11, 4, 1.2);
+    e._topY = bt - rise;
+    // tall flanking banners
+    drawTeamPennant(ctx, player, bodyX + 2, bt - 2, 10, 7);
+    drawTeamPennant(ctx, player, bodyX + bodyW - 2, bt - 2, 10, 7);
   } else if (e.subtype === 'factory') {
     // Industrial factory — dark concrete shell with corrugated metal roof
     ctx.fillStyle = '#3a3a3a';
@@ -7349,13 +7915,17 @@ function drawBuilding(e) {
     ctx.fillRect(px + 2, py + h - depth - 8, w - 4, 1.2);
   }
 
+  // Status bars float above the building's actual silhouette (tall castles/
+  // skylines rise above the footprint, so anchor to e._topY when present).
+  const barY = (e._topY != null ? Math.min(e._topY, py) : py);
+
   // HP bar if damaged
   if (e.hp < e.maxHp && !e.underConstruction) {
     const bw = w - 8, bh = 3;
     ctx.fillStyle = 'rgba(0,0,0,0.6)';
-    ctx.fillRect(px + 4, py - 6, bw, bh);
+    ctx.fillRect(px + 4, barY - 6, bw, bh);
     ctx.fillStyle = e.hp / e.maxHp > 0.5 ? '#6ba84a' : (e.hp / e.maxHp > 0.25 ? '#d4a04a' : '#d04a4a');
-    ctx.fillRect(px + 4, py - 6, bw * (e.hp / e.maxHp), bh);
+    ctx.fillRect(px + 4, barY - 6, bw * (e.hp / e.maxHp), bh);
   }
 
   // Assimilation progress bar — shown ABOVE the HP bar, in the capturing
@@ -7366,23 +7936,23 @@ function drawBuilding(e) {
     const ratio = Math.min(1, e.assimilationProgress / ASSIMILATION_DURATION);
     // Background bar
     ctx.fillStyle = 'rgba(0,0,0,0.75)';
-    ctx.fillRect(px + 4, py - 14, bw, bh);
+    ctx.fillRect(px + 4, barY - 14, bw, bh);
     // Filled portion in the capturing team's bright color, pulses
     const pulse = 0.7 + 0.3 * Math.sin(State.time * 6);
     ctx.fillStyle = captTeam ? captTeam.colorBright : '#ff8866';
     ctx.globalAlpha = pulse;
-    ctx.fillRect(px + 4, py - 14, bw * ratio, bh);
+    ctx.fillRect(px + 4, barY - 14, bw * ratio, bh);
     ctx.globalAlpha = 1;
     // Border
     ctx.strokeStyle = captTeam ? captTeam.colorBright : '#ff8866';
     ctx.lineWidth = 0.8;
-    ctx.strokeRect(px + 4, py - 14, bw, bh);
+    ctx.strokeRect(px + 4, barY - 14, bw, bh);
     // Countdown numeral
     const remain = Math.max(0, ASSIMILATION_DURATION - e.assimilationProgress) | 0;
     ctx.fillStyle = '#fff';
     ctx.font = 'bold 10px Cinzel, serif';
     ctx.textAlign = 'center';
-    ctx.fillText(`CAPTURING ${remain}s`, px + w / 2, py - 16);
+    ctx.fillText(`CAPTURING ${remain}s`, px + w / 2, barY - 16);
     ctx.textAlign = 'left';
   }
 
@@ -7412,7 +7982,13 @@ function drawBuilding(e) {
   // Destroyed-state overlay — applied AFTER all per-type art so the damage
   // looks layered on top of whatever the building used to be.
   if (e.destroyed) {
-    ctx.restore(); // pop the brightness/saturation filter
+    ctx.restore(); // pop the faded-art globalAlpha
+    // Charred darkening over the footprint (replaces the old ctx.filter dim)
+    ctx.save();
+    ctx.globalCompositeOperation = 'multiply';
+    ctx.fillStyle = 'rgba(95,75,60,0.7)';
+    ctx.fillRect(px + 1, py + 1, w - 2, h - 2);
+    ctx.restore();
     // Scorch marks: irregular black blots
     ctx.fillStyle = 'rgba(20,15,10,0.7)';
     const seed = e.id * 2654435761;
@@ -7452,41 +8028,12 @@ function drawBuilding(e) {
     // (matches the periodic particle puffs)
   }
 
-  // ── TEAM-COLOR OWNERSHIP BORDER ─────────────────────────────────────
-  // Drawn last, on top of ALL art including the destroyed overlay, so
-  // ownership is always readable no matter how damaged a building is.
-  // Two layers for legibility on any terrain:
-  //   1. thin dark outer ring (1.5px) for contrast
-  //   2. team-color inner ring (1.5px)
-  // Destroyed buildings get a thicker, higher-alpha border because the
-  // art underneath is dimmed and the fire/smoke can obscure fine details.
+  // ── TEAM-COLOR OWNERSHIP — base accent ──────────────────────────────
+  // Buildings can now rise above their footprint, so a full box border would
+  // cut across their silhouette. Instead we anchor ownership to the ground:
+  // the colored plot (drawn first) plus a front ribbon + corner posts here.
   if (player) {
-    const col = player.colorBright || player.color || '#888';
-    const isRuin = !!e.destroyed;
-    const inset = 1;
-    const bw = isRuin ? 2.5 : 1.8; // border ring width
-
-    // Outer dark ring
-    ctx.strokeStyle = 'rgba(8,5,3,0.75)';
-    ctx.lineWidth = bw + 1.5;
-    ctx.strokeRect(px + inset, py + inset, w - inset * 2, h - inset * 2);
-
-    // Team-color ring
-    ctx.strokeStyle = col;
-    ctx.lineWidth = bw;
-    ctx.globalAlpha = isRuin ? 0.95 : 0.80;
-    ctx.strokeRect(px + inset, py + inset, w - inset * 2, h - inset * 2);
-    ctx.globalAlpha = 1.0;
-
-    // Highlight on the top edge (north face gets most eye attention in
-    // isometric-ish top-down view): an extra bright strip to pop against
-    // the building's dark foundation.
-    ctx.strokeStyle = 'rgba(255,255,255,0.22)';
-    ctx.lineWidth = 1.2;
-    ctx.beginPath();
-    ctx.moveTo(px + inset + 2, py + inset + 0.6);
-    ctx.lineTo(px + w - inset - 2, py + inset + 0.6);
-    ctx.stroke();
+    drawOwnerBaseAccent(px, py, w, h, player, !!e.destroyed);
   }
 
   // Builders animating on this site (post-build, post-destroyed)
@@ -7558,11 +8105,15 @@ function drawUnit(e) {
     ctx.shadowBlur = 8;
   }
 
-  // Shadow
-  ctx.fillStyle = 'rgba(0,0,0,0.3)';
-  ctx.beginPath();
-  ctx.ellipse(px, py + 6, 6, 2, 0, 0, Math.PI*2);
-  ctx.fill();
+  // Soft directional shadow
+  if (Render.enhanced && State._shadowSprite) {
+    drawSoftShadow(px + 1, py + 6, 16, 7, 0.32);
+  } else {
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.beginPath();
+    ctx.ellipse(px, py + 6, 6, 2, 0, 0, Math.PI*2);
+    ctx.fill();
+  }
 
   if (e.subtype === 'citizen') {
     // Determine role to draw the right outfit
@@ -8567,62 +9118,94 @@ function drawFog(x0, y0, x1, y1) {
   }
 }
 
+// Build the cached minimap terrain layer with detail: per-tile variation,
+// shaded mountain caps, water depth shimmer, and sandy coastlines. Rebuilt
+// periodically (fog changes) rather than every frame, so the higher-resolution
+// minimap stays cheap.
+function buildMinimapTerrain() {
+  if (!State._mmTerrain) State._mmTerrain = document.createElement('canvas');
+  const cvs = State._mmTerrain;
+  const mw = State.minimap.width, mh = State.minimap.height;
+  if (cvs.width !== mw || cvs.height !== mh) { cvs.width = mw; cvs.height = mh; }
+  const ctx = cvs.getContext('2d');
+  ctx.fillStyle = '#0a0806';
+  ctx.fillRect(0, 0, mw, mh);
+  const sx = mw / MAP_W, sy = mh / MAP_H;
+  const base = {
+    [TERRAIN.GRASS]:    [92, 116, 74],
+    [TERRAIN.SAND]:     [170, 146, 102],
+    [TERRAIN.FOREST]:   [47, 74, 44],
+    [TERRAIN.WATER]:    [42, 80, 124],
+    [TERRAIN.MOUNTAIN]: [92, 78, 58],
+    [TERRAIN.GOLD]:     [170, 124, 42],
+  };
+  for (let y = 0; y < MAP_H; y++) {
+    const fogRow = State.fogPlayer[y], mapRow = State.map[y];
+    for (let x = 0; x < MAP_W; x++) {
+      const t = mapRow[x], f = fogRow[x];
+      const dx = x * sx, dy = y * sy, cw = sx + 0.8, ch = sy + 0.8;
+      if (f === 0) { ctx.fillStyle = '#0a0806'; ctx.fillRect(dx, dy, cw, ch); continue; }
+      let col = base[t] || base[TERRAIN.GRASS];
+      let r = col[0], g = col[1], b = col[2];
+      const seed = ((x * 73856093) ^ (y * 19349663)) >>> 0;
+      // gentle per-tile brightness variation for organic texture
+      const v = ((seed % 17) - 8) * 1.4;
+      r += v; g += v; b += v;
+      if (t === TERRAIN.MOUNTAIN) {
+        // lighter rocky/snow cap on some peaks; darker base on others
+        if (seed % 3 === 0) { r += 42; g += 42; b += 44; }
+        else if (seed % 3 === 1) { r -= 14; g -= 14; b -= 12; }
+      } else if (t === TERRAIN.WATER) {
+        // depth shimmer
+        b += Math.sin(x * 0.5 + y * 0.3) * 9;
+        g += Math.sin(x * 0.5 + y * 0.3) * 4;
+      } else if (t === TERRAIN.GRASS) {
+        // sandy coastline where grass borders water
+        let coast = false;
+        if (x > 0 && mapRow[x - 1] === TERRAIN.WATER) coast = true;
+        else if (x < MAP_W - 1 && mapRow[x + 1] === TERRAIN.WATER) coast = true;
+        else if (y > 0 && State.map[y - 1][x] === TERRAIN.WATER) coast = true;
+        else if (y < MAP_H - 1 && State.map[y + 1][x] === TERRAIN.WATER) coast = true;
+        if (coast) { r = 156; g = 136; b = 96; }
+      }
+      if (f === 1) { r *= 0.42; g *= 0.42; b *= 0.42; } // explored, not visible
+      ctx.fillStyle = `rgb(${Math.max(0, Math.min(255, r | 0))},${Math.max(0, Math.min(255, g | 0))},${Math.max(0, Math.min(255, b | 0))})`;
+      ctx.fillRect(dx, dy, cw, ch);
+    }
+  }
+  // Soft vignette so the minimap reads as a framed map
+  const vg = ctx.createRadialGradient(mw / 2, mh / 2, Math.min(mw, mh) * 0.3, mw / 2, mh / 2, Math.max(mw, mh) * 0.72);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(1, 'rgba(0,0,0,0.34)');
+  ctx.fillStyle = vg;
+  ctx.fillRect(0, 0, mw, mh);
+}
+
 function drawMinimap() {
   const ctx = State.mctx;
   const mw = State.minimap.width, mh = State.minimap.height;
-  // Backdrop — slightly bluish so unexplored regions read as "darkness" not
-  // "ground"
-  ctx.fillStyle = '#0c0a08';
-  ctx.fillRect(0, 0, mw, mh);
   const sx = mw / MAP_W, sy = mh / MAP_H;
 
-  // Tiles. We use a slightly desaturated palette tuned for the minimap
-  // (the world palette is too saturated when shrunk). Mountains and water
-  // dominate visually; grass takes a midtone.
-  const tileColor = {
-    [TERRAIN.GRASS]:    '#5a724a',
-    [TERRAIN.SAND]:     '#a89066',
-    [TERRAIN.FOREST]:   '#2f4a2c',  // (forests become resource entities at setup but keep this for the brief moment they exist as terrain)
-    [TERRAIN.WATER]:    '#2a4e7a',
-    [TERRAIN.MOUNTAIN]: '#5a4d3a',
-    [TERRAIN.GOLD]:     '#a87c2a',
-  };
-  for (let y = 0; y < MAP_H; y++) {
-    const fogRow = State.fogPlayer[y];
-    const mapRow = State.map[y];
-    for (let x = 0; x < MAP_W; x++) {
-      const t = mapRow[x];
-      const f = fogRow[x];
-      let color = tileColor[t] || '#5a724a';
-      if (f === 0) { ctx.fillStyle = '#0a0806'; }
-      else if (f === 1) {
-        // Explored-not-visible: dim each channel of the terrain color so the
-        // shape of the map is still readable but clearly past-tense
-        const r = parseInt(color.slice(1, 3), 16) * 0.4 | 0;
-        const g = parseInt(color.slice(3, 5), 16) * 0.4 | 0;
-        const b = parseInt(color.slice(5, 7), 16) * 0.4 | 0;
-        ctx.fillStyle = `rgb(${r},${g},${b})`;
-      } else {
-        ctx.fillStyle = color;
-      }
-      ctx.fillRect(x * sx, y * sy, sx + 0.5, sy + 0.5);
-    }
+  // Rebuild & blit the cached terrain layer (fog changes ~every 0.4s).
+  if (!State._mmTerrain || State._mmTerrain.width !== mw ||
+      State._mmLastBuilt == null || State.time - State._mmLastBuilt > 0.4) {
+    buildMinimapTerrain();
+    State._mmLastBuilt = State.time;
   }
+  ctx.drawImage(State._mmTerrain, 0, 0);
 
-  // Resource nodes — small dots in their resource color so the player can
-  // see where food/wood/gold patches lie.
+  // Resource nodes — small dots in their resource color.
   const resColor = { forest: '#3e6a36', gold: '#e2b450', ore: '#b8b0a0', oil: '#3a2a26' };
   for (const e of State.entities) {
     if (e.type !== 'resource' || e.fading > 0 || e.hp <= 0) continue;
     const f = State.fogPlayer[e.y | 0] && State.fogPlayer[e.y | 0][e.x | 0];
-    if (f < 1) continue; // never seen
+    if (f < 1) continue;
     const c = resColor[e.subtype] || '#888';
-    ctx.fillStyle = f === 2 ? c : `${c}80`; // half-alpha when explored-not-visible
-    ctx.fillRect((e.x - 0.4) * sx, (e.y - 0.4) * sy, Math.max(1.4, sx * 0.8), Math.max(1.4, sy * 0.8));
+    ctx.fillStyle = f === 2 ? c : `${c}80`;
+    ctx.fillRect((e.x - 0.4) * sx, (e.y - 0.4) * sy, Math.max(1.6, sx * 0.85), Math.max(1.6, sy * 0.85));
   }
 
-  // Buildings and units. Allies always shown. Enemy units only when visible.
-  // Enemy buildings shown if ever explored (as last-known position).
+  // Buildings and units.
   for (const e of State.entities) {
     if (e.fading > 0 || e.type === 'resource') continue;
     const f = State.fogPlayer[e.y | 0] && State.fogPlayer[e.y | 0][e.x | 0];
@@ -8633,51 +9216,61 @@ function drawMinimap() {
     const baseColor = player ? player.colorBright : '#888';
 
     if (e.type === 'building') {
-      // Cities are larger + outlined for visibility; other buildings are flat rectangles
-      ctx.fillStyle = baseColor;
-      ctx.fillRect(e.tx * sx, e.ty * sy, e.w * sx, e.h * sy);
+      // Destroyed ruins shown dimmer/greyed so the player can spot them to rebuild
+      ctx.fillStyle = e.destroyed ? 'rgba(90,80,70,0.85)' : baseColor;
+      const bx = e.tx * sx, by = e.ty * sy, bw = e.w * sx, bh = e.h * sy;
+      ctx.fillRect(bx, by, bw, bh);
+      // dark outline for definition at high res
+      ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+      ctx.lineWidth = Math.max(1, sx * 0.15);
+      ctx.strokeRect(bx, by, bw, bh);
       if (e.subtype === 'city') {
+        // City: white outline + soft glow halo
+        ctx.save();
+        ctx.shadowColor = baseColor;
+        ctx.shadowBlur = sx * 1.5;
         ctx.strokeStyle = '#ffffff';
-        ctx.lineWidth = 1;
-        ctx.strokeRect(e.tx * sx, e.ty * sy, e.w * sx, e.h * sy);
-        // Pulse dot at center for emphasis
+        ctx.lineWidth = Math.max(1.2, sx * 0.2);
+        ctx.strokeRect(bx, by, bw, bh);
+        ctx.restore();
         ctx.fillStyle = baseColor;
         ctx.beginPath();
-        ctx.arc((e.tx + e.w / 2) * sx, (e.ty + e.h / 2) * sy, Math.max(2.5, sx * 0.8), 0, Math.PI * 2);
+        ctx.arc((e.tx + e.w / 2) * sx, (e.ty + e.h / 2) * sy, Math.max(3, sx * 0.9), 0, Math.PI * 2);
         ctx.fill();
       }
-      // Assimilation indicator on the minimap: ring in capturing team's color
       if (e.assimilating && e.assimilationTeam && TEAMS[e.assimilationTeam]) {
         ctx.strokeStyle = TEAMS[e.assimilationTeam].colorBright;
-        ctx.lineWidth = 1.5;
+        ctx.lineWidth = Math.max(1.5, sx * 0.25);
         ctx.beginPath();
-        ctx.arc((e.tx + e.w / 2) * sx, (e.ty + e.h / 2) * sy, sx * 2, 0, Math.PI * 2);
+        ctx.arc((e.tx + e.w / 2) * sx, (e.ty + e.h / 2) * sy, sx * 2.2, 0, Math.PI * 2);
         ctx.stroke();
       }
     } else if (e.type === 'unit') {
-      // Soldiers are slightly larger and brighter than citizens so big armies
-      // stand out on the minimap.
       const isCitizen = e.subtype === 'citizen';
       const isSupport = UNITS[e.subtype] && UNITS[e.subtype].support;
+      const r = (isCitizen ? 1.8 : (isSupport ? 2.6 : 2.4)) * (sx / 2.2);
+      // dark halo for contrast then colored body
+      ctx.fillStyle = 'rgba(0,0,0,0.45)';
+      ctx.fillRect(e.x * sx - r - 0.6, e.y * sy - r - 0.6, r * 2 + 1.2, r * 2 + 1.2);
       ctx.fillStyle = baseColor;
-      const r = isCitizen ? 1.5 : (isSupport ? 2.2 : 2);
       ctx.fillRect(e.x * sx - r, e.y * sy - r, r * 2, r * 2);
-      // Bright pip on soldiers
       if (!isCitizen) {
         ctx.fillStyle = '#ffffff';
-        ctx.fillRect(e.x * sx - 0.5, e.y * sy - 0.5, 1, 1);
+        ctx.fillRect(e.x * sx - r * 0.35, e.y * sy - r * 0.35, r * 0.7, r * 0.7);
       }
     }
   }
 
-  // Viewport rect — draw the camera's current view as a thin gold rectangle
-  // so the player can see where they are looking on the minimap.
+  // Viewport rectangle
   const vx = State.camera.x / TILE * sx;
   const vy = State.camera.y / TILE * sy;
   const vw = State.canvas.width / TILE * sx;
   const vh = State.canvas.height / TILE * sy;
-  ctx.strokeStyle = 'rgba(230, 192, 96, 0.9)';
-  ctx.lineWidth = 1;
+  ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+  ctx.lineWidth = Math.max(2, sx * 0.4);
+  ctx.strokeRect(vx, vy, vw, vh);
+  ctx.strokeStyle = 'rgba(236, 200, 110, 0.95)';
+  ctx.lineWidth = Math.max(1, sx * 0.22);
   ctx.strokeRect(vx, vy, vw, vh);
 }
 
@@ -10723,19 +11316,37 @@ document.getElementById('add-slot-btn').addEventListener('click', addPlayerSlot)
 renderSlotList();
 
 document.getElementById('start-btn').addEventListener('click', () => {
-  // Re-key slots. In host mode, human-remote slots keep their assigned id;
-  // AI slots get sequential ids.
-  let ai = 0;
+  // Re-key slots so every slot gets a UNIQUE, stable player id.
+  //
+  // Order matters: human-remote slots already have an id stored in
+  // Net.clientSlots (assigned at join time). We must NOT let an AI slot be
+  // re-keyed to an id that a human-remote slot is keeping, or the bot and the
+  // remote player would collide on one id — which let a client control a bot
+  // and merged their teams. So we first collect the ids reserved by the host
+  // and remote players, then hand out 'aiN' ids to bots while skipping any
+  // reserved id.
+  const reserved = new Set();
+  reserved.add(HUMAN_ID); // slot 0 (host)
+  for (let i = 0; i < State.slots.length; i++) {
+    if (i > 0 && State.slots[i].type === 'human-remote') {
+      reserved.add(State.slots[i].id);
+    }
+  }
+  let aiCounter = 0;
+  const nextAiId = () => {
+    let id;
+    do { aiCounter++; id = 'ai' + aiCounter; } while (reserved.has(id));
+    reserved.add(id);
+    return id;
+  };
   for (let i = 0; i < State.slots.length; i++) {
     if (i === 0) {
       State.slots[i].id = HUMAN_ID;
       State.slots[i].type = 'human';
     } else if (State.slots[i].type === 'human-remote') {
-      // Keep the id already assigned when the client joined
-      // (Net.clientSlots[peerId] was set to slot.id)
+      // Keep the id assigned at join time (already in `reserved`).
     } else {
-      ai++;
-      State.slots[i].id = 'ai' + ai;
+      State.slots[i].id = nextAiId();
       State.slots[i].type = 'ai';
     }
   }
